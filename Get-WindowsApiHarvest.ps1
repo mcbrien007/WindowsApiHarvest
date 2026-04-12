@@ -1,1993 +1,1789 @@
-﻿<#
-.SYNOPSIS
-    Builds an API endpoint inventory from a Windows Tomcat server by combining
-    multiple discovery sources: access logs, deployed WAR/servlet mappings,
-    web.xml descriptors, and live netstat connections.
-
-.DESCRIPTION
-    Interrogates the local Tomcat installation and produces a deduplicated list
-    of { Host, Path, Method } tuples representing discovered API endpoints.
-    Output can be printed to the console, exported to CSV/JSON, or POSTed
-    directly to an Akamai API Security engine as inventory-only packets.
-
-    Discovery sources (all optional - script uses whatever is available):
-      1. Tomcat access logs       - real observed host/path/method from traffic
-      2. web.xml servlet mappings - declared URL patterns per deployed app
-      3. WAR file manifests       - app context roots from deployed WARs
-      4. Netstat                  - active TCP connections on the Tomcat port
-
-    Error codes:
-      E1001  EngineUrl is not a valid URI
-      E1002  EngineUrl scheme is not HTTPS
-      E1004  -SourceKey is required when -EngineUrl is provided
-      E1005  -OutputPath is required for CSV/JSON output
-      E2001  Engine preflight failed - cannot reach engine
-      E2002  Engine batch POST failed
-      E2003  TLS certificate invalid (expired, untrusted, or hostname mismatch)
-      E3001  Log directory not found
-      E3002  Log file read error
-      E3003  Log line cap reached
-      E4001  webapps directory not found
-      E4002  web.xml parse error
-      E4003  server.xml parse error
-      E4004  hosts file read error
-      E5001  No API endpoints discovered
-      E5002  Tomcat home not found
-      E6001  IIS log directory not found
-      E6002  IIS log file read error
-      E6003  IIS applicationHost.config not found or parse error
-      E6004  IIS web.config parse error
-      E7001  Node.js log directory not found
-      E7002  Node.js log/app read error
-      E8001  .NET Kestrel log directory not found
-      E8002  .NET app/config read error
-      E9001  Python log directory not found
-      E9002  Python app/config read error
-
-.PARAMETER CatalinaHome
-    Path to the Tomcat installation directory.
-    Defaults to the CATALINA_HOME environment variable, then common install paths.
-
-.PARAMETER Port
-    The HTTP/HTTPS port Tomcat is listening on. Used for netstat filtering.
-    Default: 8080
-
-.PARAMETER LogDays
-    How many days back to scan access logs. Default: 7
-
-.PARAMETER OutputFormat
-    Console (default), CSV, or JSON.
-
-.PARAMETER OutputPath
-    File path for CSV or JSON output. Required when OutputFormat is CSV or JSON.
-
-.PARAMETER EngineUrl
-    If provided, POST inventory packets to this Akamai API Security engine URL.
-
-.PARAMETER SourceType
-    sourceType from the Management API registration. Required with EngineUrl.
-
-.PARAMETER SourceIndex
-    sourceIndex from the Management API registration. Required with EngineUrl.
-
-.PARAMETER SourceKey
-    sourceKey from the Management API registration. Required with EngineUrl.
-
-.PARAMETER SkipTlsVerify
-    Skip TLS certificate verification when posting to the engine. Use only in
-    test environments.
-
-.PARAMETER BatchSize
-    Number of packets to send per HTTP POST to the engine. Default: 100
-
-.PARAMETER MaxLogLines
-    Maximum lines to read per log file. Prevents OOM on very large logs. Default: 500000
-
-.PARAMETER DynatraceUrl
-    Dynatrace tenant base URL, e.g. https://<tenant>.live.dynatrace.com
-    When provided, run metrics and a log event are pushed to Dynatrace at exit.
-
-.PARAMETER DynatraceToken
-    Dynatrace API token. Required scopes: metrics.ingest, logs.ingest.
-
-.EXAMPLE
-    # Print discovered endpoints to console
-    .\Get-TomcatApiInventory.ps1
-
-.EXAMPLE
-    # Export to JSON
-    .\Get-TomcatApiInventory.ps1 -OutputFormat JSON -OutputPath .\inventory.json
-
-.EXAMPLE
-    # Post to Akamai API Security engine
-    .\Get-TomcatApiInventory.ps1 -EngineUrl "https://engine/engine" `
-        -SourceType 49 -SourceIndex 3 -SourceKey "abc123"
-
-.EXAMPLE
-    # Full verbose run with custom batch size
-    .\Get-TomcatApiInventory.ps1 -EngineUrl "https://engine/engine" `
-        -SourceType 49 -SourceIndex 3 -SourceKey "abc123" `
-        -BatchSize 50 -Verbose
-#>
-
-[CmdletBinding()]
 param(
-    [string]  $CatalinaHome    = "",
-    [int]     $Port            = 8080,
-    [int]     $LogDays         = 7,
-    [ValidateSet("Console","CSV","JSON")]
-    [string]  $OutputFormat    = "Console",
-    [string]  $OutputPath      = "",
-    [string]  $EngineUrl       = "",
-    [int]     $SourceType      = 49,
-    [int]     $SourceIndex     = 0,
-    [string]  $SourceKey       = "",
-    [switch]  $SkipTlsVerify,
-    [int]     $MaxLogLines     = 500000,
-    [int]     $BatchSize       = 100,
+    [ValidateSet("install","uninstall","activate","status","preflight","repair","none")]
+    [string]$Action = "none",
 
-    # Dynatrace observability (optional)
-    # DynatraceUrl  : https://<tenant>.live.dynatrace.com  OR  https://<activegate>/e/<env-id>
-    # DynatraceToken: API token with metrics.ingest + logs.ingest scopes
-    [string]  $DynatraceUrl   = "",
-    [string]  $DynatraceToken = "",
+    [string]$InstallDir,
+    [string]$LogDir,
+    [string]$StateDir,
 
-    # Additional runtime discovery (all optional - auto-detected when not specified)
-    [string]  $IISLogPath     = "",   # Override IIS W3SVC log root (default: %SystemDrive%\inetpub\logs\LogFiles)
-    [string]  $IISConfigPath  = "",   # Override applicationHost.config path
-    [string]  $NodeLogPath    = "",   # PM2 / node log directory
-    [string]  $NodeAppPath    = "",   # Root of Node.js apps to scan for routes
-    [string]  $DotNetLogPath  = "",   # Kestrel / ASP.NET Core stdout log directory
-    [string]  $DotNetAppPath  = "",   # Root of .NET apps (looks for launchSettings.json)
-    [string]  $PythonLogPath  = "",   # Waitress / Gunicorn / uvicorn log directory
-    [string]  $PythonAppPath  = "",   # Root of Python apps to scan for Flask/FastAPI routes
-    [switch]  $SkipIIS,               # Skip IIS discovery
-    [switch]  $SkipNode,              # Skip Node.js discovery
-    [switch]  $SkipDotNet,            # Skip .NET Kestrel discovery
-    [switch]  $SkipPython             # Skip Python discovery
+    [switch]$DryRun,
+    [switch]$Force,
+
+    [string]$NonameSourceType = "26",
+    [string]$NonameSourceIndex = "19",
+    [string]$NonameSourceKey = "d52875f0-03cc-437e-8679-597fb37aa069",
+    [string]$NonameEngineUrl = "https://cs-internal-envTEST.nonamesec.com/engine",
+    [string]$NonameSourceVersion = "4.1.1",
+
+    [string]$LogFileName = "noname.log",
+    [switch]$UseHostBasedLogName,
+
+    [string]$LogForwardUrl,
+    [switch]$LogForwardOnInstall,
+    [switch]$LogForwardOnUninstall,
+    [switch]$LogForwardOnActivate,
+
+    # --- Dynatrace ---
+    # DynatraceApiUrl  : Your environment events endpoint, e.g.
+    #   https://<env>.live.dynatrace.com/api/v2/events/ingest
+    # DynatraceApiToken: A token with events.ingest scope.
+    # When DynatraceApiUrl is empty, all Dynatrace calls are silently skipped.
+    [string]$DynatraceApiUrl,
+    [string]$DynatraceApiToken,
+    [int]$DynatraceTimeoutSec = 10,
+
+    [string]$PackageSourceDir,
+    [switch]$EnableAzureMetadata,
+    [int]$AzureMetadataTimeoutSec = 2,
+    [int]$LogForwardTimeoutSec = 10,
+    [int]$EngineConnectivityTimeoutSec = 10,
+    [string]$RuntimeInstallArgs = "/quiet",
+    [switch]$EnableLogDirFallback,
+    [string[]]$LogDirFallbackPaths,
+    [switch]$FailOnWarnings,
+    [ValidateSet("Machine","User","Process")]
+    [string]$EnvironmentVariableScope = "Machine"
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
+#region ------ PowerShell version guard -------------------------------------------------------
+if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -lt 1) {
+    $detected = "{0} {1}" -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion
+    Write-Error (("Unsupported PowerShell version: {0}.`n" +
+                  "This script requires Windows PowerShell 5.1 (Desktop edition).`n" +
+                  "Run: powershell.exe -Version 5 -File `"$PSCommandPath`"") -f $detected)
+    exit 1
+}
+#endregion ------------------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# PS 5.1 TLS bypass helper
-# PS 6+: use -SkipCertificateCheck (per-call, safe)
-# PS 5.1: temporarily override ServicePointManager callback, then restore
-# ---------------------------------------------------------------------------
+$script:DryRun = [bool]$DryRun
+$script:Force  = [bool]$Force
 
-function Invoke-RestSkipTls {
-    param([hashtable]$Args_)
-    if ($PSVersionTable.PSVersion.Major -ge 6) {
-        $Args_['SkipCertificateCheck'] = $true
-        return Invoke-RestMethod @Args_
-    } else {
-        $prev = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-        try {
-            return Invoke-RestMethod @Args_
-        } finally {
-            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prev
-        }
+$env:SystemDirectory = [Environment]::SystemDirectory
+$appCmd = Join-Path $env:SystemDirectory "inetsrv\appcmd.exe"
+$dir = "NONAME_MODULE_INSTALL_DIR"
+
+$module64 = @{
+    moduleName     = "NonameNativeModule64"
+    dllName        = "NonameNativeModule64.dll"
+    runtimeLibrary = "VC_redist.x64.exe"
+    preCondition   = "bitness64"
+}
+
+$module32 = @{
+    moduleName     = "NonameNativeModule32"
+    dllName        = "NonameNativeModule32.dll"
+    runtimeLibrary = "VC_redist.x86.exe"
+    preCondition   = "bitness32"
+}
+
+$modules = @($module64, $module32)
+
+foreach ($module in $modules) {
+    if ($module.runtimeLibrary -match 'debug') {
+        throw "Configured runtimeLibrary must not be a debug package: $($module.runtimeLibrary)"
     }
 }
 
-# ---------------------------------------------------------------------------
-# Observability: structured logging, timing, and run telemetry
-# ---------------------------------------------------------------------------
-
-$Script:RunStart   = Get-Date
-$Script:ErrorCodes = [System.Collections.Generic.List[string]]::new()
-$Script:Telemetry  = [ordered]@{
-    RunId           = [System.Guid]::NewGuid().ToString('N').Substring(0,8).ToUpper()
-    StartTime       = $Script:RunStart.ToString('o')
-    Host_           = $env:COMPUTERNAME
-    PSVersion       = $PSVersionTable.PSVersion.ToString()
-    CatalinaHome    = ""
-    LogFilesScanned = 0
-    LogLinesRead    = 0
-    LogLineCapped   = $false
-    EndpointsRaw    = 0
-    EndpointsUnique = 0
-    EngineUrl       = $EngineUrl
-    CertSubject     = ""
-    CertExpiry      = ""
-    CertDaysLeft    = ""
-    PacketsSent     = 0
-    PacketsFailed   = 0
-    BatchesSent     = 0
-    BatchesFailed   = 0
-    ErrorCodes      = ""
-    DurationSec     = 0
-    ExitCode        = 0
+$sourceParams = @{
+    NONAME_SOURCE_TYPE    = $NonameSourceType
+    NONAME_SOURCE_INDEX   = $NonameSourceIndex
+    NONAME_SOURCE_KEY     = $NonameSourceKey
+    NONAME_ENGINE_URL     = $NonameEngineUrl
+    NONAME_SOURCE_VERSION = $NonameSourceVersion
 }
 
-function Write-Log {
+# ===========================================================================
+#region Dynatrace
+# Send a custom event to the Dynatrace Events API v2.
+# https://docs.dynatrace.com/docs/dynatrace-api/environment-api/events-v2/post-event
+#
+# eventType must be one of:
+#   CUSTOM_INFO | CUSTOM_DEPLOYMENT | CUSTOM_ANNOTATION | CUSTOM_CONFIGURATION | ERROR_EVENT
+#
+# All calls are best-effort: failures are logged as warnings, never fatal.
+# ===========================================================================
+
+function Test-DynatraceEnabled {
+    return (-not [string]::IsNullOrWhiteSpace($DynatraceApiUrl) -and
+            -not [string]::IsNullOrWhiteSpace($DynatraceApiToken))
+}
+
+function Send-DynatraceEvent {
     param(
-        [string] $Level,      # INFO | WARN | ERROR
-        [string] $Message,
-        [string] $Code = ""   # E-code, e.g. "E3002"
-    )
-    $ts     = (Get-Date).ToString('HH:mm:ss.fff')
-    $prefix = if ($Code) { "[$Code] " } else { "" }
-    $line   = "$ts  $Level  $prefix$Message"
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("CUSTOM_INFO","CUSTOM_DEPLOYMENT","CUSTOM_ANNOTATION","CUSTOM_CONFIGURATION","ERROR_EVENT")]
+        [string]$EventType,
 
-    switch ($Level) {
-        "ERROR" {
-            Write-Host $line -ForegroundColor Red
-            if ($Code) { $Script:ErrorCodes.Add($Code) }
-        }
-        "WARN"  { Write-Host $line -ForegroundColor Yellow }
-        default { Write-Host $line -ForegroundColor White  }
-    }
-}
+        [Parameter(Mandatory = $true)]
+        [string]$Title,
 
-function Write-Header([string]$text) {
-    Write-Host ""
-    Write-Host "=== $text ===" -ForegroundColor Cyan
-}
+        [string]$Description = "",
 
-function Get-Elapsed {
-    return [math]::Round(((Get-Date) - $Script:RunStart).TotalSeconds, 2)
-}
-
-function Write-RunSummary {
-    $Script:Telemetry['DurationSec']  = Get-Elapsed
-    $Script:Telemetry['ErrorCodes']   = ($Script:ErrorCodes | Select-Object -Unique) -join ', '
-
-    Write-Host ""
-    Write-Host "======================================================" -ForegroundColor Cyan
-    Write-Host "               RUN SUMMARY" -ForegroundColor Cyan
-    Write-Host "======================================================" -ForegroundColor Cyan
-    $t = $Script:Telemetry
-    Write-Host "  Run ID         : $($t['RunId'])"
-    Write-Host "  Host           : $($t['Host_'])"
-    Write-Host "  PS Version     : $($t['PSVersion'])"
-    Write-Host "  Catalina Home  : $($t['CatalinaHome'])"
-    Write-Host "  Duration       : $($t['DurationSec'])s"
-    Write-Host ""
-    Write-Host "  Log files      : $($t['LogFilesScanned'])"
-    Write-Host "  Log lines read : $($t['LogLinesRead'])"
-    Write-Host "  Line cap hit   : $($t['LogLineCapped'])"
-    Write-Host "  Raw endpoints  : $($t['EndpointsRaw'])"
-    Write-Host "  Unique endpoints: $($t['EndpointsUnique'])"
-    if ($t['EngineUrl']) {
-        Write-Host ""
-        Write-Host "  Engine URL     : $($t['EngineUrl'])"
-        if ($t['CertSubject']) {
-            Write-Host "  Cert subject   : $($t['CertSubject'])"
-            $certColor = if ($t['CertDaysLeft'] -gt 30) { "Green" } elseif ($t['CertDaysLeft'] -gt 7) { "Yellow" } else { "Red" }
-            Write-Host "  Cert expiry    : $($t['CertExpiry'])  ($($t['CertDaysLeft']) days left)" -ForegroundColor $certColor
-        }
-        Write-Host "  Packets sent   : $($t['PacketsSent'])"
-        Write-Host "  Packets failed : $($t['PacketsFailed'])"
-        Write-Host "  Batches sent   : $($t['BatchesSent'])"
-        Write-Host "  Batches failed : $($t['BatchesFailed'])"
-    }
-    if ($t['ErrorCodes']) {
-        Write-Host ""
-        Write-Host "  Error codes    : $($t['ErrorCodes'])" -ForegroundColor Red
-    } else {
-        Write-Host ""
-        Write-Host "  Error codes    : none" -ForegroundColor Green
-    }
-    Write-Host "  Exit code      : $($t['ExitCode'])"
-    Write-Host ""
-}
-
-function Exit-Script([int]$code) {
-    $Script:Telemetry['ExitCode'] = $code
-    Write-RunSummary
-    if ($DynatraceUrl -and $DynatraceToken) {
-        Send-ToDynatrace
-    }
-    exit $code
-}
-
-# ---------------------------------------------------------------------------
-# Dynatrace observability: metrics ingest v2 + log ingest v2
-# Metrics: all numeric telemetry counters as gauges, tagged with run.id
-# Log:     full telemetry as a single structured log event
-# ---------------------------------------------------------------------------
-
-function Send-ToDynatrace {
-    $t       = $Script:Telemetry
-    $baseUrl = $DynatraceUrl.TrimEnd('/')
-    $headers = @{
-        'Authorization' = 'Api-Token ' + $DynatraceToken
-        'Content-Type'  = 'text/plain; charset=utf-8'
-    }
-
-    # ------------------------------------------------------------------
-    # Metrics (Dynatrace Metrics Ingest v2 line protocol)
-    # Format: metric.key,dim1=val1,dim2=val2 gauge,<value> <timestamp_ms>
-    # ------------------------------------------------------------------
-    $tsMs    = [long]([double]::Parse((Get-Date -UFormat %s)) * 1000)
-    $runId   = $t['RunId']
-    $host_   = $t['Host_'] -replace '[^a-zA-Z0-9._-]', '_'
-    $dims    = "run.id=$runId,host=$host_"
-    $success = if ($t['ExitCode'] -eq 0) { 1 } else { 0 }
-
-    $lines = @(
-        "tomcat.inventory.log_files_scanned,$dims gauge,$($t['LogFilesScanned']) $tsMs",
-        "tomcat.inventory.log_lines_read,$dims gauge,$($t['LogLinesRead']) $tsMs",
-        "tomcat.inventory.endpoints_raw,$dims gauge,$($t['EndpointsRaw']) $tsMs",
-        "tomcat.inventory.endpoints_unique,$dims gauge,$($t['EndpointsUnique']) $tsMs",
-        "tomcat.inventory.packets_sent,$dims gauge,$($t['PacketsSent']) $tsMs",
-        "tomcat.inventory.packets_failed,$dims gauge,$($t['PacketsFailed']) $tsMs",
-        "tomcat.inventory.batches_sent,$dims gauge,$($t['BatchesSent']) $tsMs",
-        "tomcat.inventory.batches_failed,$dims gauge,$($t['BatchesFailed']) $tsMs",
-        "tomcat.inventory.duration_sec,$dims gauge,$($t['DurationSec']) $tsMs",
-        "tomcat.inventory.success,$dims gauge,$success $tsMs"
+        [hashtable]$Properties = @{}
     )
 
-    if ($t['CertDaysLeft'] -ne '') {
-        $lines += "tomcat.inventory.cert_days_left,$dims gauge,$($t['CertDaysLeft']) $tsMs"
+    if (-not (Test-DynatraceEnabled)) { return }
+
+    # Standard properties always included for correlation in the Dynatrace UI.
+    $mergedProps = @{
+        "noname.action"     = $Action
+        "noname.computer"   = $env:COMPUTERNAME
+        "noname.version"    = $NonameSourceVersion
+        "noname.engine_url" = $NonameEngineUrl
+        "noname.dry_run"    = ([string]$script:DryRun)
+        "noname.force"      = ([string]$script:Force)
+    }
+    foreach ($k in $Properties.Keys) { $mergedProps[$k] = [string]$Properties[$k] }
+
+    $body = @{
+        eventType  = $EventType
+        title      = $Title
+        properties = $mergedProps
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Description)) {
+        $body["description"] = $Description
+    }
+
+    $bodyJson = $body | ConvertTo-Json -Depth 6 -Compress
+
+    if ($script:DryRun) {
+        Write-DryRun "Would POST Dynatrace event '$EventType / $Title' to '$DynatraceApiUrl'."
+        return
     }
 
     try {
-        $metricsUrl  = $baseUrl + '/api/v2/metrics/ingest'
-        $metricsBody = $lines -join "`n"
-        $mArgs = @{
-            Uri     = $metricsUrl
-            Method  = 'POST'
-            Headers = $headers
-            Body    = $metricsBody
-            ErrorAction = 'Stop'
+        $headers = @{
+            "Authorization" = "Api-Token $DynatraceApiToken"
+            "Content-Type"  = "application/json"
         }
-        Invoke-RestMethod @mArgs | Out-Null
-        Write-Log INFO ("Dynatrace: " + $lines.Count + " metrics sent to " + $metricsUrl)
-    } catch {
-        Write-Log WARN ("Dynatrace metrics ingest failed: " + $_)
+        Invoke-WebRequest -Uri $DynatraceApiUrl `
+                          -Method Post `
+                          -Headers $headers `
+                          -Body $bodyJson `
+                          -TimeoutSec $DynatraceTimeoutSec `
+                          -UseBasicParsing `
+                          -ErrorAction Stop | Out-Null
+        Write-Host -ForegroundColor Cyan "Dynatrace event sent: $EventType / $Title"
     }
-
-    # ------------------------------------------------------------------
-    # Log event (Dynatrace Log Ingest v2)
-    # Single JSON array with one structured log record
-    # ------------------------------------------------------------------
-    $logHeaders = @{
-        'Authorization' = 'Api-Token ' + $DynatraceToken
-        'Content-Type'  = 'application/json; charset=utf-8'
-    }
-
-    $errorCodesVal = if ($t['ErrorCodes']) { $t['ErrorCodes'] } else { 'none' }
-    $severity      = if ($t['ExitCode'] -ne 0) { 'ERROR' } elseif ($t['ErrorCodes']) { 'WARN' } else { 'INFO' }
-
-    $logRecord = [ordered]@{
-        timestamp         = $tsMs
-        severity          = $severity
-        content           = ('tomcat-api-inventory run ' + $runId + ' on ' + $t['Host_'] + ': ' + $t['EndpointsUnique'] + ' endpoints, exit=' + $t['ExitCode'])
-        'run.id'          = $runId
-        'host.name'       = $t['Host_']
-        'ps.version'      = $t['PSVersion']
-        'catalina.home'   = $t['CatalinaHome']
-        'duration.sec'    = $t['DurationSec']
-        'log.files'       = $t['LogFilesScanned']
-        'log.lines'       = $t['LogLinesRead']
-        'log.line_capped' = $t['LogLineCapped']
-        'endpoints.raw'   = $t['EndpointsRaw']
-        'endpoints.unique'= $t['EndpointsUnique']
-        'engine.url'      = $t['EngineUrl']
-        'packets.sent'    = $t['PacketsSent']
-        'packets.failed'  = $t['PacketsFailed']
-        'cert.subject'    = $t['CertSubject']
-        'cert.expiry'     = $t['CertExpiry']
-        'cert.days_left'  = $t['CertDaysLeft']
-        'error.codes'     = $errorCodesVal
-        'exit.code'       = $t['ExitCode']
-    }
-
-    try {
-        $logsUrl  = $baseUrl + '/api/v2/logs/ingest'
-        $logsBody = ConvertTo-Json @($logRecord) -Depth 4 -Compress
-        $lArgs = @{
-            Uri     = $logsUrl
-            Method  = 'POST'
-            Headers = $logHeaders
-            Body    = $logsBody
-            ErrorAction = 'Stop'
-        }
-        Invoke-RestMethod @lArgs | Out-Null
-        Write-Log INFO ("Dynatrace: log event sent to " + $logsUrl)
-    } catch {
-        Write-Log WARN ("Dynatrace log ingest failed: " + $_)
+    catch {
+        Write-Host -ForegroundColor Yellow "Warning: Failed sending Dynatrace event '$Title'. $($_.Exception.Message)"
     }
 }
 
-# ---------------------------------------------------------------------------
-# Push full endpoint inventory to Dynatrace log ingest
-# One log record per endpoint — queryable by host, path, method, status, source
-# Batched at 100 records per POST (DT recommended max per request)
-# ---------------------------------------------------------------------------
+#endregion Dynatrace
 
-function Send-EndpointsToDynatrace([array]$inventory) {
-    if (-not $inventory -or $inventory.Count -eq 0) { return }
+function Write-DryRun {
+    param([Parameter(Mandatory = $true)][string]$Message)
+    Write-Host -ForegroundColor Magenta "[DRY-RUN] $Message"
+}
 
-    $baseUrl    = $DynatraceUrl.TrimEnd('/')
-    $logsUrl    = $baseUrl + '/api/v2/logs/ingest'
-    $logHeaders = @{
-        'Authorization' = 'Api-Token ' + $DynatraceToken
-        'Content-Type'  = 'application/json; charset=utf-8'
-    }
-
-    $runId  = $Script:Telemetry['RunId']
-    $host_  = $Script:Telemetry['Host_']
-    $tsMs   = [long]([double]::Parse((Get-Date -UFormat %s)) * 1000)
-    $dtBatch = 100
-    $sent   = 0
-    $failed = 0
-
-    for ($i = 0; $i -lt $inventory.Count; $i += $dtBatch) {
-        $slice   = $inventory[$i .. [Math]::Min($i + $dtBatch - 1, $inventory.Count - 1)]
-        $records = foreach ($ep in $slice) {
-            [ordered]@{
-                timestamp        = $tsMs
-                severity         = 'INFO'
-                content          = ($ep.Method + ' ' + $ep.Host + $ep.Path)
-                'run.id'         = $runId
-                'host.name'      = $host_
-                'api.host'       = $ep.Host
-                'api.path'       = $ep.Path
-                'api.method'     = $ep.Method
-                'api.status'     = if ($ep.Status) { [string]$ep.Status } else { '' }
-                'api.source'     = $ep.Source
-                'api.contenttype'= $ep.ContentType
-            }
-        }
-
+function Import-RequiredModules {
+    $requiredModules = @("WebAdministration", "IISAdministration")
+    foreach ($m in $requiredModules) {
         try {
-            $body = ConvertTo-Json @($records) -Depth 4 -Compress
-            $lArgs = @{
-                Uri     = $logsUrl
-                Method  = 'POST'
-                Headers = $logHeaders
-                Body    = $body
-                ErrorAction = 'Stop'
+            if (-not (Get-Module -ListAvailable -Name $m)) {
+                Write-Host -ForegroundColor Yellow "Warning: PowerShell module '$m' not found. IIS features or management tools may not be installed."
+                continue
             }
-            Invoke-RestMethod @lArgs | Out-Null
-            $sent += $slice.Count
-        } catch {
-            Write-Log WARN ("Dynatrace endpoint batch failed (offset " + $i + "): " + $_)
-            $failed += $slice.Count
+            Import-Module $m -ErrorAction Stop -Force
+            Write-Host -ForegroundColor Cyan "Loaded PowerShell module '$m'."
         }
-    }
-
-    Write-Log INFO ("Dynatrace: " + $sent + " endpoint records sent, " + $failed + " failed.")
-}
-
-# ---------------------------------------------------------------------------
-# Fix 1 + E1xxx: Validate engine URL is HTTPS before doing any work
-# ---------------------------------------------------------------------------
-if ($EngineUrl) {
-    try {
-        $parsedUri = [System.Uri]::new($EngineUrl)
-        if ($parsedUri.Scheme -ne 'https') {
-            Write-Log ERROR "EngineUrl must use HTTPS. Got: '$($parsedUri.Scheme)'." "E1002"
-            Exit-Script 1
+        catch {
+            Write-Host -ForegroundColor Yellow "Warning: Failed to load PowerShell module '$m'. $($_.Exception.Message)"
         }
-    } catch {
-        Write-Log ERROR "EngineUrl is not a valid URI: '$EngineUrl'" "E1001"
-        Exit-Script 1
     }
 }
 
-# ---------------------------------------------------------------------------
-# Preflight: verify the engine is reachable and responds with "OK"
-# ---------------------------------------------------------------------------
-
-function Test-EngineConnectivity([string]$engineUrl, [bool]$skipTls) {
-    $t0 = Get-Date
-    Write-Log INFO "Preflight: checking engine at $engineUrl ..."
+function Test-IISAvailable {
     try {
-        $checkArgs = @{ Uri = $engineUrl; Method = 'GET'; ErrorAction = 'Stop' }
-        $resp = if ($skipTls) { Invoke-RestSkipTls $checkArgs } else { Invoke-RestMethod @checkArgs }
-        $ms   = [math]::Round(((Get-Date) - $t0).TotalMilliseconds)
-        if ("$resp" -match '(?i)ok') {
-            Write-Log INFO ("Engine preflight passed (OK) in " + $ms + "ms.")
-        } else {
-            Write-Log WARN ("Engine reachable (" + $ms + "ms) but response does not contain OK: " + $resp)
-            Write-Log WARN "Proceeding - engine may not expose a health endpoint."
-        }
-    } catch {
-        Write-Log ERROR ("Engine preflight failed - cannot reach " + $engineUrl + ": " + $_) "E2001"
-        Exit-Script 1
+        if (Get-Command Get-WebConfiguration -ErrorAction SilentlyContinue) { return $true }
+        if (Test-Path -LiteralPath $appCmd) { return $true }
+        return $false
+    }
+    catch {
+        return $false
     }
 }
 
-# ---------------------------------------------------------------------------
-# TLS certificate check - validates cert, reports expiry, fails on E2003
-# Uses raw TCP + SslStream so it works on PS 5.1 without Invoke-WebRequest hacks
-# ---------------------------------------------------------------------------
-
-function Test-TlsCertificate([string]$engineUrl, [bool]$skipTls) {
-    $uri = [System.Uri]::new($engineUrl)
-    if ($uri.Scheme -ne 'https') { return }   # nothing to check for plain HTTP
-
-    $host_ = $uri.Host
-    $port_ = if ($uri.Port -gt 0) { $uri.Port } else { 443 }
-
-    Write-Log INFO ("TLS check: connecting to " + $host_ + ":" + $port_ + " ...")
-
-    $tcp    = $null
-    $ssl    = $null
+function Get-IISVersion {
     try {
-        $tcp = [System.Net.Sockets.TcpClient]::new($host_, $port_)
+        $regPath = "HKLM:\SOFTWARE\Microsoft\InetStp"
+        $props = Get-ItemProperty -Path $regPath -ErrorAction Stop
+        $major = $props.MajorVersion
+        $minor = $props.MinorVersion
+        return [PSCustomObject]@{
+            Detected = $true
+            Major    = $major
+            Minor    = $minor
+            Version  = "$major.$minor"
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            Detected = $false
+            Major    = $null
+            Minor    = $null
+            Version  = $null
+        }
+    }
+}
 
-        if ($skipTls) {
-            # Accept any cert - just retrieve it for reporting
-            $callback = [System.Net.Security.RemoteCertificateValidationCallback]{
-                param($s,$c,$ch,$e) return $true
+function Test-IsAdministrator {
+    try {
+        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-EnvironmentVariableTarget {
+    switch ($EnvironmentVariableScope) {
+        "Machine" { return [System.EnvironmentVariableTarget]::Machine }
+        "User"    { return [System.EnvironmentVariableTarget]::User }
+        "Process" { return [System.EnvironmentVariableTarget]::Process }
+        default   { return [System.EnvironmentVariableTarget]::Machine }
+    }
+}
+
+function Get-Preferred-LogFileName {
+    if ($UseHostBasedLogName) { return ("noname-{0}.log" -f $env:COMPUTERNAME) }
+    if ([string]::IsNullOrWhiteSpace($LogFileName)) { return "noname.log" }
+    return $LogFileName
+}
+
+function Resolve-FullPathSafe {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathValue,
+        [Parameter(Mandatory = $true)][string]$ParamName
+    )
+    try {
+        return [System.IO.Path]::GetFullPath($PathValue)
+    }
+    catch {
+        throw "Invalid $ParamName provided '$PathValue'"
+    }
+}
+
+function Get-Package-Source-Dir {
+    if ([string]::IsNullOrWhiteSpace($PackageSourceDir)) { return (Get-Location).Path }
+    try {
+        return [System.IO.Path]::GetFullPath($PackageSourceDir)
+    }
+    catch {
+        throw "Invalid PackageSourceDir provided '$PackageSourceDir'"
+    }
+}
+
+function Test-DirectoryWritable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$NoCreate
+    )
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            if ($NoCreate -or $script:DryRun) { return $false }
+            New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        if ($script:DryRun) { return $true }
+        $probe = Join-Path $Path ("write-test-{0}.tmp" -f [guid]::NewGuid().ToString())
+        [System.IO.File]::WriteAllText($probe, "test")
+        Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-PathWritable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$NoCreate
+    )
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            if ($NoCreate -or $script:DryRun) { return $false }
+            New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        if ($script:DryRun) { return $true }
+        $probe = Join-Path $Path ("preflight-{0}.tmp" -f ([guid]::NewGuid().ToString()))
+        [System.IO.File]::WriteAllText($probe, "test")
+        Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Resolve-LogDirWithFallback {
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($LogDir)) {
+        $candidates.Add((Resolve-FullPathSafe -PathValue $LogDir -ParamName "LogDir"))
+    }
+
+    if ($EnableLogDirFallback) {
+        if ($LogDirFallbackPaths -and $LogDirFallbackPaths.Count -gt 0) {
+            foreach ($fallbackPath in $LogDirFallbackPaths) {
+                try {
+                    $resolvedFallback = [System.IO.Path]::GetFullPath($fallbackPath)
+                    if (-not $candidates.Contains($resolvedFallback)) {
+                        $candidates.Add($resolvedFallback)
+                    }
+                }
+                catch {
+                    Write-Host -ForegroundColor Yellow "Warning: Invalid fallback log path '$fallbackPath'."
+                }
             }
-            $ssl = [System.Net.Security.SslStream]::new($tcp.GetStream(), $false, $callback)
-        } else {
-            $ssl = [System.Net.Security.SslStream]::new($tcp.GetStream(), $false)
         }
+        else {
+            $defaultProgramDataLogDir = Join-Path $env:ProgramData "Noname\Logs"
+            $tempRoot = [System.IO.Path]::GetTempPath()
+            $tempLogDir = Join-Path $tempRoot "Noname\Logs"
+            if (-not $candidates.Contains($defaultProgramDataLogDir)) { $candidates.Add($defaultProgramDataLogDir) }
+            if (-not $candidates.Contains($tempLogDir)) { $candidates.Add($tempLogDir) }
+        }
+    }
 
-        $ssl.AuthenticateAsClient($host_)
-        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($ssl.RemoteCertificate)
+    if ($candidates.Count -eq 0) {
+        $candidates.Add((Join-Path $env:ProgramData "Noname\Logs"))
+    }
 
-        $expiry    = $cert.NotAfter
-        $daysLeft  = [math]::Floor(($expiry - (Get-Date)).TotalDays)
-        $subject   = $cert.Subject
-        $thumbprint = $cert.Thumbprint
+    foreach ($candidate in $candidates) {
+        if ($script:DryRun) {
+            Write-DryRun "Would evaluate log directory candidate '$candidate'."
+            if (Test-Path -LiteralPath $candidate) { return $candidate }
+            continue
+        }
+        if (Test-DirectoryWritable -Path $candidate) { return $candidate }
+        Write-Host -ForegroundColor Yellow "Warning: Log directory candidate not writable '$candidate'."
+    }
 
-        $Script:Telemetry['CertSubject']  = $subject
-        $Script:Telemetry['CertExpiry']   = $expiry.ToString('yyyy-MM-dd')
-        $Script:Telemetry['CertDaysLeft'] = $daysLeft
+    if ($script:DryRun -and $candidates.Count -gt 0) {
+        Write-Host -ForegroundColor Yellow "Warning: Dry-run could not prove any log directory candidate already exists. Returning first candidate only for simulation."
+        return $candidates[0]
+    }
 
-        if (-not $skipTls) {
-            # Verify hostname matches cert CN or SAN
-            $sans = $cert.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Subject Alternative Name' }
-            $sanText = if ($sans) { $sans.Format($false) } else { "" }
-            $cnMatch  = $subject -match ('CN=' + [regex]::Escape($host_))
-            $sanMatch = $sanText -match [regex]::Escape($host_)
-            if (-not $cnMatch -and -not $sanMatch) {
-                Write-Log ERROR ("TLS hostname mismatch: cert is for '" + $subject + "', expected '" + $host_ + "'") "E2003"
-                Exit-Script 1
+    throw "Unable to resolve a writable log directory from the configured candidates."
+}
+
+function Validate-InstallParameters {
+    $validationErrors = New-Object System.Collections.Generic.List[string]
+
+    if ([string]::IsNullOrWhiteSpace($NonameSourceType))   { $validationErrors.Add("NonameSourceType cannot be empty.") }
+    if ([string]::IsNullOrWhiteSpace($NonameSourceIndex))  { $validationErrors.Add("NonameSourceIndex cannot be empty.") }
+    if ([string]::IsNullOrWhiteSpace($NonameSourceKey))    { $validationErrors.Add("NonameSourceKey cannot be empty.") }
+
+    if ([string]::IsNullOrWhiteSpace($NonameEngineUrl)) {
+        $validationErrors.Add("NonameEngineUrl cannot be empty.")
+    }
+    else {
+        $uri = $null
+        if (-not [System.Uri]::TryCreate($NonameEngineUrl, [System.UriKind]::Absolute, [ref]$uri)) {
+            $validationErrors.Add("NonameEngineUrl must be a valid absolute URL.")
+        }
+        elseif ($uri.Scheme -ne [System.Uri]::UriSchemeHttps) {
+            $validationErrors.Add("NonameEngineUrl must use HTTPS.")
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($NonameSourceVersion)) { $validationErrors.Add("NonameSourceVersion cannot be empty.") }
+
+    if (-not [string]::IsNullOrWhiteSpace($LogDir)) {
+        try { [System.IO.Path]::GetFullPath($LogDir) | Out-Null } catch { $validationErrors.Add("LogDir is not a valid path.") }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($StateDir)) {
+        try { [System.IO.Path]::GetFullPath($StateDir) | Out-Null } catch { $validationErrors.Add("StateDir is not a valid path.") }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($LogFileName)) {
+        $validationErrors.Add("LogFileName cannot be empty.")
+    }
+    else {
+        foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars()) {
+            if ($LogFileName.Contains([string]$invalidChar)) {
+                $validationErrors.Add("LogFileName contains invalid filename characters.")
+                break
             }
         }
+    }
 
-        if ($daysLeft -le 0) {
-            Write-Log ERROR ("TLS cert EXPIRED on " + $expiry.ToString('yyyy-MM-dd') + " (" + [math]::Abs($daysLeft) + " days ago). Thumbprint: " + $thumbprint) "E2003"
-            if (-not $skipTls) { Exit-Script 1 }
-        } elseif ($daysLeft -le 7) {
-            Write-Log ERROR ("TLS cert expires in " + $daysLeft + " days (" + $expiry.ToString('yyyy-MM-dd') + "). Renew immediately.") "E2003"
-        } elseif ($daysLeft -le 30) {
-            Write-Log WARN ("TLS cert expires in " + $daysLeft + " days (" + $expiry.ToString('yyyy-MM-dd') + "). Plan renewal.")
-        } else {
-            Write-Log INFO ("TLS cert valid. Subject: " + $subject + "  Expires: " + $expiry.ToString('yyyy-MM-dd') + " (" + $daysLeft + " days)")
+    if (-not [string]::IsNullOrWhiteSpace($LogForwardUrl)) {
+        $forwardUri = $null
+        if (-not [System.Uri]::TryCreate($LogForwardUrl, [System.UriKind]::Absolute, [ref]$forwardUri)) {
+            $validationErrors.Add("LogForwardUrl must be a valid absolute URL.")
         }
+        elseif ($forwardUri.Scheme -ne [System.Uri]::UriSchemeHttps) {
+            $validationErrors.Add("LogForwardUrl must use HTTPS.")
+        }
+    }
 
-    } catch [System.Security.Authentication.AuthenticationException] {
-        Write-Log ERROR ("TLS handshake failed for " + $host_ + " - untrusted or invalid certificate: " + $_.Exception.Message) "E2003"
-        if (-not $skipTls) { Exit-Script 1 }
-    } catch {
-        Write-Log WARN ("TLS check could not complete for " + $host_ + ": " + $_)
-    } finally {
-        if ($ssl) { $ssl.Close() }
-        if ($tcp) { $tcp.Close() }
+    # Dynatrace param validation
+    if (-not [string]::IsNullOrWhiteSpace($DynatraceApiUrl)) {
+        $dtUri = $null
+        if (-not [System.Uri]::TryCreate($DynatraceApiUrl, [System.UriKind]::Absolute, [ref]$dtUri)) {
+            $validationErrors.Add("DynatraceApiUrl must be a valid absolute URL.")
+        }
+        elseif ($dtUri.Scheme -ne [System.Uri]::UriSchemeHttps) {
+            $validationErrors.Add("DynatraceApiUrl must use HTTPS.")
+        }
+        if ([string]::IsNullOrWhiteSpace($DynatraceApiToken)) {
+            $validationErrors.Add("DynatraceApiToken is required when DynatraceApiUrl is specified.")
+        }
+    }
+    if ($DynatraceTimeoutSec -lt 1) { $validationErrors.Add("DynatraceTimeoutSec must be greater than 0.") }
+
+    if (-not [string]::IsNullOrWhiteSpace($PackageSourceDir)) {
+        try { [System.IO.Path]::GetFullPath($PackageSourceDir) | Out-Null } catch { $validationErrors.Add("PackageSourceDir is not a valid path.") }
+    }
+
+    if ($AzureMetadataTimeoutSec -lt 1)        { $validationErrors.Add("AzureMetadataTimeoutSec must be greater than 0.") }
+    if ($LogForwardTimeoutSec -lt 1)           { $validationErrors.Add("LogForwardTimeoutSec must be greater than 0.") }
+    if ($EngineConnectivityTimeoutSec -lt 1)   { $validationErrors.Add("EngineConnectivityTimeoutSec must be greater than 0.") }
+    if ([string]::IsNullOrWhiteSpace($RuntimeInstallArgs)) { $validationErrors.Add("RuntimeInstallArgs cannot be empty.") }
+
+    if ($LogDirFallbackPaths) {
+        foreach ($fallbackPath in $LogDirFallbackPaths) {
+            try { [System.IO.Path]::GetFullPath($fallbackPath) | Out-Null }
+            catch { $validationErrors.Add("LogDirFallbackPaths contains an invalid path: $fallbackPath") }
+        }
+    }
+
+    if ($Action -in @("install","repair") -and $EnvironmentVariableScope -ne "Machine") {
+        $validationErrors.Add("EnvironmentVariableScope must be 'Machine' for install/repair because IIS worker processes need persistent machine-level variables.")
+    }
+
+    if ($validationErrors.Count -gt 0) {
+        throw ("Install parameter validation failed:`n - " + ($validationErrors -join "`n - "))
     }
 }
 
-if ($EngineUrl) {
-    # Preflight before spending time on discovery
-    Test-TlsCertificate $EngineUrl $SkipTlsVerify.IsPresent
-    Test-EngineConnectivity $EngineUrl $SkipTlsVerify.IsPresent
-}
-
-# ---------------------------------------------------------------------------
-# Catalina home resolution
-# ---------------------------------------------------------------------------
-
-function Resolve-CatalinaHome {
-    if ($CatalinaHome -and (Test-Path $CatalinaHome)) { return $CatalinaHome }
-
-    $fromEnv = $env:CATALINA_HOME
-    if ($fromEnv -and (Test-Path $fromEnv)) { return $fromEnv }
-
-    $candidates = @(
-        "C:\Program Files\Apache Software Foundation\Tomcat*",
-        "C:\Program Files\Tomcat*",
-        "C:\Program Files (x86)\Apache Software Foundation\Tomcat*",
-        "C:\Tomcat*",
-        "C:\apache-tomcat*",
-        "C:\tools\tomcat*",
-        "C:\Apps\*tomcat*",
-        "C:\Apps\*Tomcat*",
-        "C:\WWW\*tomcat*",
-        "C:\WWW\*Tomcat*",
-        "C:\inetpub\*tomcat*"
+function Add-PreflightResult {
+    param(
+        [Parameter(Mandatory = $true)]$Results,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][ValidateSet("PASS","WARN","FAIL")][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Details,
+        # Pass the caught $_ ErrorRecord to capture full exception detail on failures.
+        $ErrorRecord = $null
     )
 
-    try {
-        $svc = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
-               Where-Object { $_.Name -match 'tomcat' -or $_.DisplayName -match 'tomcat' } |
-               Select-Object -First 1
-        if ($svc -and $svc.PathName) {
-            $exePath = ($svc.PathName -split '"' | Where-Object { $_ -match '\.exe' } | Select-Object -First 1)
-            if (-not $exePath) { $exePath = $svc.PathName.Split(' ')[0].Trim('"') }
-            $svcHome = Split-Path (Split-Path $exePath -Parent) -Parent
-            if ($svcHome -and (Test-Path $svcHome)) {
-                Write-Verbose "Found Tomcat via Windows service: $svcHome"
-                return $svcHome
-            }
+    $errorDetail = $null
+    if ($null -ne $ErrorRecord) {
+        $ex = $ErrorRecord.Exception
+        $errorDetail = [ordered]@{
+            ExceptionType    = $ex.GetType().FullName
+            ExceptionMessage = $ex.Message
+            InnerException   = if ($null -ne $ex.InnerException) { $ex.InnerException.Message } else { $null }
+            ScriptStackTrace = $ErrorRecord.ScriptStackTrace
+            PositionMessage  = if ($null -ne $ErrorRecord.InvocationInfo) { $ErrorRecord.InvocationInfo.PositionMessage } else { $null }
         }
-    } catch { }
-
-    foreach ($pattern in $candidates) {
-        $match = Get-Item $pattern -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($match) { return $match.FullName }
     }
 
-    Write-Log WARN "Could not locate Tomcat installation. Set -CatalinaHome or CATALINA_HOME." "E5002"
-    return $null
+    $Results.Add([PSCustomObject]@{
+        Check       = $Name
+        Status      = $Status
+        Details     = $Details
+        ErrorDetail = $errorDetail
+    }) | Out-Null
 }
 
-# ---------------------------------------------------------------------------
-# Discover hostnames from hosts file
-# ---------------------------------------------------------------------------
+function Get-Default-Paths {
+    $resolvedLogDir = Resolve-LogDirWithFallback
 
-function Resolve-LocalHostnames {
-    $hostsPath = "C:\Windows\System32\drivers\etc\hosts"
-    $names     = [System.Collections.Generic.List[string]]::new()
-
-    try {
-        $fs     = [System.IO.File]::Open($hostsPath,
-                    [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::Read,
-                    [System.IO.FileShare]::ReadWrite)
-        $reader = [System.IO.StreamReader]::new($fs)
-        while (-not $reader.EndOfStream) {
-            $line = $reader.ReadLine().Trim()
-            if ($line -match '^\s*#' -or $line -eq '') { continue }
-            if ($line -match '^(127\.0\.0\.1|::1|0\.0\.0\.0)\s+(.+)') {
-                $Matches[2] -split '\s+' | ForEach-Object {
-                    $n = $_.Trim().ToLower()
-                    if ($n -and $n -ne 'localhost' -and $n -notmatch '^#' -and
-                        $n -match '^[a-z0-9][a-z0-9._-]*(?::\d{1,5})?$') {
-                        $names.Add($n)
-                    } elseif ($n -and $n -ne 'localhost' -and $n -notmatch '^#') {
-                        Write-Verbose "  Skipping invalid hostname from hosts file: '$n'"
-                    }
-                }
-            }
-        }
-        $reader.Close(); $fs.Close()
-    } catch {
-        Write-Log WARN "Could not read hosts file: $_" "E4004"
+    $resolvedStateDir = if ([string]::IsNullOrWhiteSpace($StateDir)) {
+        Join-Path $env:ProgramData "Noname\State"
+    }
+    else {
+        Resolve-FullPathSafe -PathValue $StateDir -ParamName "StateDir"
     }
 
-    if ($names.Count -eq 0) { $names.Add("localhost") }
-    Write-Log INFO "  Hosts file hostnames: $($names -join ', ')"
-    return $names.ToArray()
-}
-
-# ---------------------------------------------------------------------------
-# Read virtual host names from server.xml (read-only, XXE-safe)
-# ---------------------------------------------------------------------------
-
-function Resolve-HostnamesFromServerXml([string]$catalinaHome) {
-    $serverXml = Join-Path $catalinaHome "conf\server.xml"
-    $names     = [System.Collections.Generic.List[string]]::new()
-
-    if (-not (Test-Path $serverXml)) {
-        Write-Verbose "  server.xml not found at $serverXml"
-        return $names.ToArray()
+    $resolvedInstallDir = if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+        Join-Path $env:ProgramFiles "Noname Module"
+    }
+    else {
+        Resolve-FullPathSafe -PathValue $InstallDir -ParamName "InstallDir"
     }
 
-    try {
-        $xmlDoc    = [System.Xml.XmlDocument]::new()
-        $xmlReader = $null
-        try {
-            $settings = [System.Xml.XmlReaderSettings]::new()
-            $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-            $settings.XmlResolver   = $null
-            $xmlReader = [System.Xml.XmlReader]::Create($serverXml, $settings)
-            $xmlDoc.Load($xmlReader)
-        } finally {
-            if ($xmlReader) { $xmlReader.Close() }
-        }
+    $resolvedLogFileName = Get-Preferred-LogFileName
 
-        $xpHost  = "//*[local-name()='Host']"
-        $xpAlias = "*[local-name()='Alias']"
-        $hostNodes = $xmlDoc.SelectNodes($xpHost)
-        foreach ($node in $hostNodes) {
-            $n = $node.GetAttribute("name")
-            if ($n -and $n -match '^[a-z0-9][a-z0-9._-]*$') { $names.Add($n.ToLower()) }
-            foreach ($alias in $node.SelectNodes($xpAlias)) {
-                $a = $alias.InnerText.Trim().ToLower()
-                if ($a -and $a -match '^[a-z0-9][a-z0-9._-]*$') { $names.Add($a) }
-            }
-        }
-    } catch {
-        Write-Log WARN "Could not parse server.xml: $_" "E4003"
+    [PSCustomObject]@{
+        InstallDir             = $resolvedInstallDir
+        LogDir                 = $resolvedLogDir
+        LogFileName            = $resolvedLogFileName
+        LogFilePath            = Join-Path $resolvedLogDir $resolvedLogFileName
+        StateDir               = $resolvedStateDir
+        PendingInstallMarker   = Join-Path $resolvedStateDir "pending-install-activation.json"
+        PendingUninstallMarker = Join-Path $resolvedStateDir "pending-uninstall-activation.json"
+        PreflightStateFile     = Join-Path $resolvedStateDir "last-preflight.json"
+        IISConfigPath          = Join-Path $env:windir "System32\inetsrv\config\applicationHost.config"
+        AppCmdPath             = Join-Path $env:windir "System32\inetsrv\appcmd.exe"
     }
-
-    Write-Log INFO "  server.xml hostnames: $($names -join ', ')"
-    return $names.ToArray()
-}
-
-# ---------------------------------------------------------------------------
-# Path filter
-# ---------------------------------------------------------------------------
-
-$SkipExtensions = @(
-    ".html",".htm",".js",".css",".ico",".png",".jpg",".jpeg",".gif",
-    ".svg",".woff",".woff2",".ttf",".eot",".map",".txt",".xml",
-    ".pdf",".zip",".tar",".gz"
-)
-
-function Test-ApiPath([string]$path) {
-    $bare = $path -replace '\?.*', ''
-    $ext  = [System.IO.Path]::GetExtension($bare).ToLower()
-    return ($SkipExtensions -notcontains $ext)
-}
-
-# ---------------------------------------------------------------------------
-# SOURCE 1: Access logs
-# ---------------------------------------------------------------------------
-
-function Get-EndpointsFromLogs([string]$catalinaHome) {
-    Write-Header "Source 1: Access Logs"
-    $t0 = Get-Date
-
-    $logDir = Join-Path $catalinaHome "logs"
-    if (-not (Test-Path $logDir)) {
-        Write-Log WARN "Log directory not found: $logDir" "E3001"
-        return @()
-    }
-
-    $cutoff  = (Get-Date).AddDays(-$LogDays)
-    $logFiles = @(Get-ChildItem $logDir -Filter "*.txt" -ErrorAction SilentlyContinue) +
-                @(Get-ChildItem $logDir -Filter "*.log" -ErrorAction SilentlyContinue) |
-                Where-Object { $_ -and $_.LastWriteTime -ge $cutoff }
-
-    if (-not $logFiles) {
-        Write-Log WARN "No log files found in the last $LogDays days." "E3001"
-        return @()
-    }
-
-    $Script:Telemetry['LogFilesScanned'] = @($logFiles).Count
-    Write-Log INFO "Scanning $(@($logFiles).Count) log file(s) since $($cutoff.ToString('yyyy-MM-dd'))..."
-
-    $results   = [System.Collections.Generic.HashSet[string]]::new()
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $totalLines = 0
-
-    $combinedPattern = [string]'"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|TRACE)\s+(\S+)\s+HTTP'
-    $w3cPattern      = [string]'\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|TRACE)\s+(\S+)\s'
-    $hostPattern     = [string]'^([a-zA-Z0-9._-]+)(?::\d+)?\s+\S+\s+\S+\s+\S+\s+\['
-
-    foreach ($file in $logFiles) {
-        Write-Verbose "  Scanning $($file.Name) ($([math]::Round($file.Length/1KB))KB)"
-        $ft0    = Get-Date
-        $fs     = $null
-        $reader = $null
-        $fileLines = 0
-        try {
-            $fs     = [System.IO.File]::Open($file.FullName,
-                          [System.IO.FileMode]::Open,
-                          [System.IO.FileAccess]::Read,
-                          [System.IO.FileShare]::ReadWrite)
-            $reader = [System.IO.StreamReader]::new($fs)
-
-            while (-not $reader.EndOfStream) {
-                $line = $reader.ReadLine()
-                $fileLines++
-                $totalLines++
-                if ($totalLines -gt $MaxLogLines) {
-                    Write-Log WARN "$($file.Name): reached $MaxLogLines line cap, stopping early." "E3003"
-                    $Script:Telemetry['LogLineCapped'] = $true
-                    break
-                }
-
-                $m = [regex]::Match($line, $combinedPattern)
-                if (-not $m.Success) { $m = [regex]::Match($line, $w3cPattern) }
-                if (-not $m.Success) { continue }
-
-                $method = $m.Groups[1].Value.ToUpper()
-                $path   = $m.Groups[2].Value
-                if (-not (Test-ApiPath $path)) { continue }
-
-                $logHost      = "localhost"
-                $hostHdrMatch = [regex]::Match($line, $hostPattern)
-                if ($hostHdrMatch.Success) {
-                    $candidate = $hostHdrMatch.Groups[1].Value.ToLower()
-                    if ($candidate -match '^[a-z0-9][a-z0-9._-]*$' -and $candidate -ne '-') {
-                        $logHost = $candidate
-                    }
-                }
-
-                $statusMatch = [regex]::Match($line, '"\s+(\d{3})\s+')
-                $status      = if ($statusMatch.Success) { [int]$statusMatch.Groups[1].Value } else { $null }
-
-                $ctMatch     = [regex]::Match($line, 'application/(?:json|xml|x-www-form-urlencoded|grpc|graphql|msgpack|cbor|octet-stream)|text/xml', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                $contentType = if ($ctMatch.Success) { $ctMatch.Value.ToLower() } else { "" }
-
-                $key = "$method|$logHost|$($path -replace '\?.*','')"
-                if ($results.Add($key)) {
-                    $endpoints.Add([PSCustomObject]@{
-                        Host           = $logHost
-                        Path           = ($path -replace '\?.*','')
-                        Method         = $method
-                        Source         = "AccessLog"
-                        Status         = $status
-                        ContentType    = $contentType
-                        SampleRequest  = ""
-                        SampleResponse = ""
-                    })
-                }
-            }
-            $fms = [math]::Round(((Get-Date) - $ft0).TotalMilliseconds)
-            Write-Verbose "  $($file.Name): $fileLines lines in ${fms}ms"
-        } catch {
-            Write-Log WARN "Could not read $($file.Name): $_" "E3002"
-        } finally {
-            if ($reader) { $reader.Close() }
-            if ($fs)     { $fs.Close() }
-        }
-    }
-
-    $Script:Telemetry['LogLinesRead'] = $totalLines
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO "Access logs: $($endpoints.Count) unique endpoints from $totalLines lines in ${elapsed}s."
-    return $endpoints
-}
-
-# ---------------------------------------------------------------------------
-# SOURCE 2: web.xml servlet mappings
-# ---------------------------------------------------------------------------
-
-function Get-EndpointsFromWebXml([string]$catalinaHome, [string[]]$hostnames) {
-    Write-Header "Source 2: web.xml Servlet Mappings"
-    $t0 = Get-Date
-
-    $webappsDir = Join-Path $catalinaHome "webapps"
-    if (-not (Test-Path $webappsDir)) {
-        Write-Log WARN "webapps directory not found: $webappsDir" "E4001"
-        return @()
-    }
-
-    $endpoints   = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $seen        = [System.Collections.Generic.HashSet[string]]::new()
-    $webXmlFiles = Get-ChildItem $webappsDir -Recurse -Filter "web.xml" -ErrorAction SilentlyContinue
-    $parseErrors = 0
-
-    foreach ($wxf in $webXmlFiles) {
-        Write-Verbose "  Parsing $($wxf.FullName)"
-        try {
-            $xmlDoc    = [System.Xml.XmlDocument]::new()
-            $xmlReader = $null
-            try {
-                $settings = [System.Xml.XmlReaderSettings]::new()
-                $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-                $settings.XmlResolver   = $null
-                $xmlReader = [System.Xml.XmlReader]::Create($wxf.FullName, $settings)
-                $xmlDoc.Load($xmlReader)
-            } finally {
-                if ($xmlReader) { $xmlReader.Close() }
-            }
-
-            $appDir      = $wxf.Directory.Parent.FullName
-            $appName     = Split-Path $appDir -Leaf
-            $contextRoot = if ($appName -eq "ROOT") { "" } else { "/$appName" }
-
-            $mappings = $xmlDoc.SelectNodes("//servlet-mapping")
-            if (-not $mappings -or $mappings.Count -eq 0) {
-                $mappings = $xmlDoc.SelectNodes("//*[local-name()='servlet-mapping']")
-            }
-
-            foreach ($mapping in $mappings) {
-                $pattern = $mapping.SelectSingleNode("url-pattern")
-                if (-not $pattern) { $pattern = $mapping.SelectSingleNode("*[local-name()='url-pattern']") }
-                if (-not $pattern) { continue }
-
-                $urlPattern = $pattern.InnerText.Trim()
-                if ($urlPattern -eq "/*" -or $urlPattern -eq "/") { continue }
-                if ($urlPattern -match '^\*\.\w+$') { continue }
-
-                $fullPath = $contextRoot + $urlPattern
-                if (-not (Test-ApiPath $fullPath)) { continue }
-
-                foreach ($hn in $hostnames) {
-                    foreach ($method in @("GET","POST","PUT","DELETE","PATCH")) {
-                        $key = "$method|$hn|$fullPath"
-                        if ($seen.Add($key)) {
-                            $endpoints.Add([PSCustomObject]@{
-                                Host           = $hn
-                                Path           = $fullPath
-                                Method         = $method
-                                Source         = "web.xml:$($wxf.FullName)"
-                                Status         = $null
-                                ContentType    = ""
-                                SampleRequest  = ""
-                                SampleResponse = ""
-                            })
-                        }
-                    }
-                }
-            }
-        } catch {
-            Write-Log WARN "Could not parse $($wxf.FullName): $_" "E4002"
-            $parseErrors++
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO "web.xml: $($endpoints.Count) endpoint/method combos from $(@($webXmlFiles).Count) file(s) in ${elapsed}s$(if ($parseErrors) { " [$parseErrors parse errors]" })."
-    return $endpoints
-}
-
-# ---------------------------------------------------------------------------
-# SOURCE 3: Deployed WAR context roots
-# ---------------------------------------------------------------------------
-
-function Get-EndpointsFromWars([string]$catalinaHome, [string[]]$hostnames) {
-    Write-Header "Source 3: Deployed WARs / App Context Roots"
-    $t0 = Get-Date
-
-    $webappsDir = Join-Path $catalinaHome "webapps"
-    if (-not (Test-Path $webappsDir)) { return @() }
-
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $wars      = Get-ChildItem $webappsDir -Filter "*.war" -ErrorAction SilentlyContinue
-
-    foreach ($war in $wars) {
-        $contextRoot = "/" + [System.IO.Path]::GetFileNameWithoutExtension($war.Name)
-        if ($contextRoot -eq "/ROOT") { $contextRoot = "" }
-        Write-Verbose "  WAR: $($war.Name) -> $contextRoot/"
-
-        foreach ($hn in $hostnames) {
-            foreach ($method in @("GET","POST")) {
-                $endpoints.Add([PSCustomObject]@{
-                    Host           = $hn
-                    Path           = "$contextRoot/"
-                    Method         = $method
-                    Source         = "WAR:$($war.Name)"
-                    Status         = $null
-                    ContentType    = ""
-                    SampleRequest  = ""
-                    SampleResponse = ""
-                })
-            }
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO "WARs: $($endpoints.Count) context-root endpoints from $(@($wars).Count) WAR(s) in ${elapsed}s."
-    return $endpoints
-}
-
-# ---------------------------------------------------------------------------
-# SOURCE 4: Active connections via netstat
-# ---------------------------------------------------------------------------
-
-function Get-EndpointsFromNetstat([int]$port) {
-    Write-Header "Source 4: Active TCP Connections (netstat)"
-    $t0 = Get-Date
-
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $seen      = [System.Collections.Generic.HashSet[string]]::new()
-
-    try {
-        $connections = Get-NetTCPConnection -LocalPort $port -State Established `
-                       -ErrorAction SilentlyContinue
-        if (-not $connections) {
-            Write-Log INFO "No active established connections on port $port."
-            return @()
-        }
-
-        foreach ($conn in $connections) {
-            $remote = $conn.RemoteAddress
-            $key    = "CONNECTED|$remote"
-            if ($seen.Add($key)) {
-                $endpoints.Add([PSCustomObject]@{
-                    Host           = $conn.LocalAddress
-                    Path           = "/ (active connection from $remote)"
-                    Method         = "UNKNOWN"
-                    Source         = "Netstat"
-                    Status         = $null
-                    ContentType    = ""
-                    SampleRequest  = ""
-                    SampleResponse = ""
-                })
-            }
-        }
-        $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-        Write-Log INFO "Netstat: $(@($connections).Count) active connections on port $port in ${elapsed}s."
-    } catch {
-        Write-Log WARN "netstat query failed: $_"
-    }
-
-    return $endpoints
 }
 
 # ===========================================================================
-# IIS DISCOVERY
+#region Preflight state persistence
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# IIS SOURCE 1: W3SVC access logs
-# Default format fields (W3C extended): date time s-ip cs-method cs-uri-stem
-#   cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer)
-#   sc-status sc-substatus sc-win32-status time-taken
-# We look for: cs-method  cs-uri-stem  cs(Host)  sc-status
-# ---------------------------------------------------------------------------
-
-function Get-IISLogRoot {
-    if ($IISLogPath -and (Test-Path $IISLogPath)) { return $IISLogPath }
-    $default = Join-Path $env:SystemDrive "inetpub\logs\LogFiles"
-    if (Test-Path $default) { return $default }
-    # Try reading from applicationHost.config
-    try {
-        $cfg = Get-IISAppHostConfig
-        if ($cfg) {
-            $logNode = $cfg.SelectSingleNode("//*[local-name()='logFile']")
-            if ($logNode) {
-                $dir = $logNode.GetAttribute("directory") -replace '%SystemDrive%', $env:SystemDrive
-                if ($dir -and (Test-Path $dir)) { return $dir }
-            }
-        }
-    } catch {}
-    return $null
-}
-
-function Get-IISAppHostConfig {
-    $path = $IISConfigPath
-    if (-not $path) {
-        $path = Join-Path $env:windir "System32\inetsrv\config\applicationHost.config"
-    }
-    if (-not (Test-Path $path)) { return $null }
-    $doc    = [System.Xml.XmlDocument]::new()
-    $reader = $null
-    try {
-        $settings = [System.Xml.XmlReaderSettings]::new()
-        $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-        $settings.XmlResolver   = $null
-        $reader = [System.Xml.XmlReader]::Create($path, $settings)
-        $doc.Load($reader)
-    } finally {
-        if ($reader) { $reader.Close() }
-    }
-    return $doc
-}
-
-function Get-EndpointsFromIISLogs([string[]]$hostnames) {
-    Write-Header "IIS Source 1: W3SVC Access Logs"
-    $t0 = Get-Date
-
-    $logRoot = Get-IISLogRoot
-    if (-not $logRoot) {
-        Write-Log WARN "IIS log directory not found." "E6001"
-        return @()
-    }
-
-    $cutoff   = (Get-Date).AddDays(-$LogDays)
-    $logFiles = @(Get-ChildItem $logRoot -Recurse -Filter "u_ex*.log" -ErrorAction SilentlyContinue |
-                  Where-Object { $_.LastWriteTime -ge $cutoff })
-    # Also catch custom-named logs
-    $logFiles += @(Get-ChildItem $logRoot -Recurse -Filter "*.log" -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -notmatch '^u_ex' -and $_.LastWriteTime -ge $cutoff })
-
-    if (-not $logFiles) {
-        Write-Log WARN "No IIS log files found in the last $LogDays days under $logRoot." "E6001"
-        return @()
-    }
-
-    $Script:Telemetry['IISLogFilesScanned'] = @($logFiles).Count
-    Write-Log INFO ("Scanning " + @($logFiles).Count + " IIS log file(s)...")
-
-    $results   = [System.Collections.Generic.HashSet[string]]::new()
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $totalLines = 0
-
-    # W3C field positions — read from #Fields directive in each file
-    $methodIdx  = -1; $uriIdx = -1; $hostIdx = -1; $statusIdx = -1; $portIdx = -1
-
-    foreach ($file in $logFiles) {
-        $fs = $null; $reader = $null
-        try {
-            $fs     = [System.IO.File]::Open($file.FullName,
-                        [System.IO.FileMode]::Open,
-                        [System.IO.FileAccess]::Read,
-                        [System.IO.FileShare]::ReadWrite)
-            $reader = [System.IO.StreamReader]::new($fs)
-            # Reset field positions per file
-            $methodIdx = -1; $uriIdx = -1; $hostIdx = -1; $statusIdx = -1; $portIdx = -1
-
-            while (-not $reader.EndOfStream) {
-                $line = $reader.ReadLine()
-                $totalLines++
-                if ($totalLines -gt $MaxLogLines) {
-                    Write-Log WARN ("IIS logs: reached " + $MaxLogLines + " line cap.") "E6002"
-                    $Script:Telemetry['LogLineCapped'] = $true
-                    break
-                }
-
-                # Parse #Fields directive to get column positions
-                if ($line.StartsWith('#Fields:')) {
-                    $fields    = ($line.Substring(8).Trim()) -split '\s+'
-                    $methodIdx = [array]::IndexOf($fields, 'cs-method')
-                    $uriIdx    = [array]::IndexOf($fields, 'cs-uri-stem')
-                    $hostIdx   = [array]::IndexOf($fields, 'cs(Host)')
-                    $statusIdx = [array]::IndexOf($fields, 'sc-status')
-                    $portIdx   = [array]::IndexOf($fields, 's-port')
-                    continue
-                }
-                if ($line.StartsWith('#')) { continue }
-                if ($methodIdx -lt 0 -or $uriIdx -lt 0) { continue }
-
-                $cols = $line -split '\s+'
-                if ($cols.Count -le [Math]::Max($methodIdx, $uriIdx)) { continue }
-
-                $method = $cols[$methodIdx].ToUpper()
-                if ($method -notmatch '^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|TRACE)$') { continue }
-
-                $path = $cols[$uriIdx]
-                if (-not (Test-ApiPath $path)) { continue }
-
-                $logHost = 'localhost'
-                if ($hostIdx -ge 0 -and $cols.Count -gt $hostIdx -and $cols[$hostIdx] -ne '-') {
-                    $candidate = ($cols[$hostIdx] -split ':')[0].ToLower()
-                    if ($candidate -match '^[a-z0-9][a-z0-9._-]*$') { $logHost = $candidate }
-                } elseif ($portIdx -ge 0 -and $cols.Count -gt $portIdx) {
-                    # No host header — use first matching hostname for this port
-                    $sitePort = $cols[$portIdx]
-                    $match    = $hostnames | Where-Object { $_ -ne 'localhost' } | Select-Object -First 1
-                    if ($match) { $logHost = $match }
-                }
-
-                $status = $null
-                if ($statusIdx -ge 0 -and $cols.Count -gt $statusIdx) {
-                    $sv = $cols[$statusIdx]
-                    if ($sv -match '^\d{3}$') { $status = [int]$sv }
-                }
-
-                $key = "$method|$logHost|$path"
-                if ($results.Add($key)) {
-                    $endpoints.Add([PSCustomObject]@{
-                        Host           = $logHost
-                        Path           = $path
-                        Method         = $method
-                        Source         = "IIS:AccessLog"
-                        Status         = $status
-                        ContentType    = ""
-                        SampleRequest  = ""
-                        SampleResponse = ""
-                    })
-                }
-            }
-        } catch {
-            Write-Log WARN ("Could not read IIS log " + $file.Name + ": " + $_) "E6002"
-        } finally {
-            if ($reader) { $reader.Close() }
-            if ($fs)     { $fs.Close() }
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO ("IIS logs: " + $endpoints.Count + " unique endpoints from " + $totalLines + " lines in " + $elapsed + "s.")
-    return $endpoints
-}
-
-# ---------------------------------------------------------------------------
-# IIS SOURCE 2: Hostnames from applicationHost.config site bindings
-# ---------------------------------------------------------------------------
-
-function Get-HostnamesFromIIS {
-    $names = [System.Collections.Generic.List[string]]::new()
-    try {
-        $cfg = Get-IISAppHostConfig
-        if (-not $cfg) {
-            Write-Log WARN "applicationHost.config not found." "E6003"
-            return @()
-        }
-        # <binding protocol="http" bindingInformation="*:80:mysite.example.com" />
-        $bindings = $cfg.SelectNodes("//*[local-name()='binding']")
-        foreach ($b in $bindings) {
-            $info = $b.GetAttribute("bindingInformation")
-            if (-not $info) { continue }
-            $parts = $info -split ':'
-            # format: ip:port:hostname
-            if ($parts.Count -ge 3 -and $parts[2]) {
-                $n = $parts[2].Trim().ToLower()
-                if ($n -match '^[a-z0-9][a-z0-9._-]*$') { $names.Add($n) }
-            }
-        }
-    } catch {
-        Write-Log WARN ("Could not parse applicationHost.config: " + $_) "E6003"
-    }
-    Write-Log INFO ("IIS hostnames from applicationHost.config: " + ($names -join ', '))
-    return $names.ToArray()
-}
-
-# ---------------------------------------------------------------------------
-# IIS SOURCE 3: web.config HTTP handlers and route tables
-# Looks for: <add verb="GET,POST" path="/api/*" ...>
-#            ASP.NET route config comments and attribute routes
-# ---------------------------------------------------------------------------
-
-function Get-EndpointsFromIISWebConfig([string[]]$hostnames) {
-    Write-Header "IIS Source 2: web.config Handlers / Routes"
-    $t0 = Get-Date
-
-    $searchRoots = @(
-        (Join-Path $env:SystemDrive "inetpub\wwwroot"),
-        (Join-Path $env:SystemDrive "inetpub\sites")
+function Write-PreflightState {
+    param(
+        [Parameter(Mandatory = $true)]$PreflightResult
     )
-    # Also scan any sites declared in applicationHost.config
+
+    $paths = Get-Default-Paths
+    New-NonameDirectory -Path $paths.StateDir
+
+    $markerPath = $paths.PreflightStateFile
+
+    # Build the Results array carrying full ErrorDetail for every check so that
+    # failed/warned checks include exception type, message, inner exception,
+    # and script stack trace — not just the human-readable Details string.
+    $resultRows = @($PreflightResult.Results | ForEach-Object {
+        $row = [ordered]@{
+            Check   = $_.Check
+            Status  = $_.Status
+            Details = $_.Details
+        }
+        if ($null -ne $_.ErrorDetail) {
+            $row['ErrorDetail'] = $_.ErrorDetail
+        }
+        $row
+    })
+
+    $payload = [ordered]@{
+        SchemaVersion    = "1.1"
+        TimestampUtc     = (Get-Date).ToUniversalTime().ToString("o")
+        ComputerName     = $env:COMPUTERNAME
+        NonameVersion    = $NonameSourceVersion
+        EngineUrl        = $NonameEngineUrl
+        Summary          = [ordered]@{
+            Pass              = $PreflightResult.Summary.Pass
+            Warn              = $PreflightResult.Summary.Warn
+            Fail              = $PreflightResult.Summary.Fail
+            ExitCode          = $PreflightResult.Summary.ExitCode
+            EngineCheckStatus = $PreflightResult.Summary.EngineCheckStatus
+            FailedChecks      = @($PreflightResult.Results | Where-Object { $_.Status -eq 'FAIL' } | ForEach-Object { $_.Check })
+            WarnedChecks      = @($PreflightResult.Results | Where-Object { $_.Status -eq 'WARN' } | ForEach-Object { $_.Check })
+        }
+        Results          = $resultRows
+    } | ConvertTo-Json -Depth 8
+
+    if ($script:DryRun) {
+        Write-DryRun "Would write preflight state to '$markerPath'."
+        return
+    }
+
+    Set-Content -LiteralPath $markerPath -Value $payload -Encoding UTF8
+    Write-Host -ForegroundColor Cyan "Preflight state written to '$markerPath'."
+}
+
+function Read-PreflightState {
+    $paths = Get-Default-Paths
+    $markerPath = $paths.PreflightStateFile
+
+    if (-not (Test-Path -LiteralPath $markerPath)) { return $null }
+
     try {
-        $cfg = Get-IISAppHostConfig
-        if ($cfg) {
-            $physPaths = $cfg.SelectNodes("//*[local-name()='virtualDirectory']")
-            foreach ($vd in $physPaths) {
-                $phys = $vd.GetAttribute("physicalPath") -replace '%SystemDrive%', $env:SystemDrive
-                if ($phys -and (Test-Path $phys)) { $searchRoots += $phys }
-            }
+        $raw = Get-Content -LiteralPath $markerPath -Raw -Encoding UTF8
+        return $raw | ConvertFrom-Json
+    }
+    catch {
+        Write-Host -ForegroundColor Yellow "Warning: Could not read preflight state file '$markerPath'. $($_.Exception.Message)"
+        return $null
+    }
+}
+
+#endregion Preflight state persistence
+
+function Test-EngineReachable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$TimeoutSec = 10
+    )
+
+    $uri = $null
+    try { $uri = [Uri]$Url }
+    catch {
+        return @{ Reachable = $false; Details = "Invalid URL."; HttpReachable = $false; TcpReachable = $false; EngineOk = $false; StatusCode = $null; Body = $null }
+    }
+
+    try {
+        $response = Invoke-WebRequest -Uri $Url -Method Get -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+
+        $statusOk    = ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300)
+        $bodyText    = if ($null -ne $response.Content) { [string]$response.Content } else { "" }
+        $trimmedBody = $bodyText.Trim()
+        $bodyLooksOk = ($trimmedBody -eq "OK")
+
+        if ($statusOk -and $bodyLooksOk) {
+            return @{ Reachable = $true;  Details = "Engine returned HTTP $($response.StatusCode) and body 'OK'."; HttpReachable = $true; TcpReachable = $true; EngineOk = $true;  StatusCode = $response.StatusCode; Body = $trimmedBody }
         }
-    } catch {}
+        if ($statusOk) {
+            return @{ Reachable = $false; Details = "Engine returned HTTP $($response.StatusCode) but body was not exactly 'OK'. Body: '$trimmedBody'"; HttpReachable = $true; TcpReachable = $true; EngineOk = $false; StatusCode = $response.StatusCode; Body = $trimmedBody }
+        }
+        return @{ Reachable = $false; Details = "Engine returned unexpected HTTP status $($response.StatusCode)."; HttpReachable = $true; TcpReachable = $true; EngineOk = $false; StatusCode = $response.StatusCode; Body = $trimmedBody }
+    }
+    catch {
+        $httpError = $_.Exception.Message
+        $port = if ($uri.Port -gt 0) { $uri.Port } elseif ($uri.Scheme -eq "https") { 443 } else { 80 }
 
-    $endpoints  = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $seen       = [System.Collections.Generic.HashSet[string]]::new()
-    $parseErrors = 0
+        $tcpOk = $false
+        if (Get-Command Test-NetConnection -ErrorAction SilentlyContinue) {
+            try {
+                $tcp = Test-NetConnection -ComputerName $uri.Host -Port $port -WarningAction SilentlyContinue
+                $tcpOk = [bool]$tcp.TcpTestSucceeded
+            }
+            catch { $tcpOk = $false }
+        }
 
-    $webConfigs = foreach ($root in ($searchRoots | Select-Object -Unique)) {
-        if (Test-Path $root) {
-            Get-ChildItem $root -Recurse -Filter "web.config" -ErrorAction SilentlyContinue
+        if ($tcpOk) {
+            return @{ Reachable = $false; Details = "TCP connectivity to $($uri.Host):$port succeeded, but HTTP GET failed: $httpError"; HttpReachable = $false; TcpReachable = $true; EngineOk = $false; StatusCode = $null; Body = $null }
+        }
+        return @{ Reachable = $false; Details = "HTTP GET failed and TCP connectivity could not be confirmed. Error: $httpError"; HttpReachable = $false; TcpReachable = $false; EngineOk = $false; StatusCode = $null; Body = $null }
+    }
+}
+
+function Test-Preflight {
+    $results = New-Object System.Collections.Generic.List[object]
+
+    $paths = $null
+    try {
+        $paths = Get-Default-Paths
+        Add-PreflightResult -Results $results -Name "Path resolution" -Status "PASS" -Details "Resolved install/log/state paths successfully."
+    }
+    catch {
+        Add-PreflightResult -Results $results -Name "Path resolution" -Status "FAIL" -Details $_.Exception.Message -ErrorRecord $_
+    }
+
+    try {
+        $osCaption = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption
+        Add-PreflightResult -Results $results -Name "Operating system" -Status "PASS" -Details $osCaption
+    }
+    catch {
+        Add-PreflightResult -Results $results -Name "Operating system" -Status "FAIL" -Details "Unable to confirm Windows operating system." -ErrorRecord $_
+    }
+
+    Add-PreflightResult -Results $results -Name "PowerShell version" -Status "PASS" `
+        -Details ("Windows PowerShell {0}" -f $PSVersionTable.PSVersion)
+
+    if (Test-IsAdministrator) {
+        Add-PreflightResult -Results $results -Name "Administrator rights" -Status "PASS" -Details "Running elevated."
+    }
+    else {
+        Add-PreflightResult -Results $results -Name "Administrator rights" -Status "FAIL" -Details "Script must be run as Administrator."
+    }
+
+    if (Get-Module -ListAvailable -Name WebAdministration) {
+        Add-PreflightResult -Results $results -Name "WebAdministration module" -Status "PASS" -Details "Module is available."
+    }
+    else {
+        Add-PreflightResult -Results $results -Name "WebAdministration module" -Status "WARN" -Details "Module not available. appcmd fallback may still work."
+    }
+
+    if (Get-Module -ListAvailable -Name IISAdministration) {
+        Add-PreflightResult -Results $results -Name "IISAdministration module" -Status "PASS" -Details "Module is available."
+    }
+    else {
+        Add-PreflightResult -Results $results -Name "IISAdministration module" -Status "WARN" -Details "Module not available."
+    }
+
+    if (Test-IISAvailable) {
+        Add-PreflightResult -Results $results -Name "IIS availability" -Status "PASS" -Details "IIS management commands or appcmd are available."
+    }
+    else {
+        Add-PreflightResult -Results $results -Name "IIS availability" -Status "FAIL" -Details "IIS management commands are not available."
+    }
+
+    $iisVersion = Get-IISVersion
+    if (-not $iisVersion.Detected) {
+        Add-PreflightResult -Results $results -Name "IIS version" -Status "FAIL" -Details "Unable to determine IIS version."
+    }
+    elseif ($iisVersion.Major -eq 10) {
+        Add-PreflightResult -Results $results -Name "IIS version" -Status "PASS" -Details "IIS $($iisVersion.Version) detected."
+    }
+    else {
+        Add-PreflightResult -Results $results -Name "IIS version" -Status "FAIL" -Details "Unsupported IIS version: $($iisVersion.Version). IIS 10 is required."
+    }
+
+    $pathsForIIS = $null
+    try { $pathsForIIS = Get-Default-Paths } catch {}
+
+    if ($pathsForIIS -and (Test-Path -LiteralPath $pathsForIIS.AppCmdPath)) {
+        Add-PreflightResult -Results $results -Name "appcmd.exe" -Status "PASS" -Details $pathsForIIS.AppCmdPath
+    }
+    else {
+        Add-PreflightResult -Results $results -Name "appcmd.exe" -Status "FAIL" -Details "appcmd.exe not found. IIS management tools may not be installed."
+    }
+
+    try {
+        $packageDir = Get-Package-Source-Dir
+        Add-PreflightResult -Results $results -Name "PackageSourceDir" -Status "PASS" -Details $packageDir
+    }
+    catch {
+        Add-PreflightResult -Results $results -Name "PackageSourceDir" -Status "FAIL" -Details $_.Exception.Message -ErrorRecord $_
+    }
+
+    Add-PreflightResult -Results $results -Name "Environment variable scope"  -Status "PASS" -Details $EnvironmentVariableScope
+    Add-PreflightResult -Results $results -Name "Azure metadata enabled"       -Status "PASS" -Details ([string]$EnableAzureMetadata)
+    Add-PreflightResult -Results $results -Name "Azure metadata timeout"       -Status "PASS" -Details ([string]$AzureMetadataTimeoutSec)
+    Add-PreflightResult -Results $results -Name "Log forwarding timeout"       -Status "PASS" -Details ([string]$LogForwardTimeoutSec)
+    Add-PreflightResult -Results $results -Name "Engine connectivity timeout"  -Status "PASS" -Details ([string]$EngineConnectivityTimeoutSec)
+    Add-PreflightResult -Results $results -Name "Runtime install args"         -Status "PASS" -Details $RuntimeInstallArgs
+    Add-PreflightResult -Results $results -Name "Log dir fallback enabled"     -Status "PASS" -Details ([string]$EnableLogDirFallback)
+    Add-PreflightResult -Results $results -Name "Fail on warnings"             -Status "PASS" -Details ([string]$FailOnWarnings)
+    Add-PreflightResult -Results $results -Name "Force mode"                   -Status "PASS" -Details ([string]$script:Force)
+
+    # Dynatrace configuration check
+    if (-not [string]::IsNullOrWhiteSpace($DynatraceApiUrl)) {
+        if (-not [string]::IsNullOrWhiteSpace($DynatraceApiToken)) {
+            Add-PreflightResult -Results $results -Name "Dynatrace integration" -Status "PASS" -Details "Dynatrace URL and token configured."
+        }
+        else {
+            Add-PreflightResult -Results $results -Name "Dynatrace integration" -Status "WARN" -Details "DynatraceApiUrl is set but DynatraceApiToken is missing. Events will be skipped."
+        }
+    }
+    else {
+        Add-PreflightResult -Results $results -Name "Dynatrace integration" -Status "PASS" -Details "Dynatrace not configured (optional)."
+    }
+
+    foreach ($module in $modules) {
+        $dllPath = Join-Path (Get-Package-Source-Dir) $module.dllName
+        if (Test-Path -LiteralPath $dllPath) {
+            Add-PreflightResult -Results $results -Name ("Source DLL: " + $module.dllName) -Status "PASS" -Details $dllPath
+        }
+        else {
+            Add-PreflightResult -Results $results -Name ("Source DLL: " + $module.dllName) -Status "FAIL" -Details ("Missing file: {0}" -f $dllPath)
+        }
+
+        $runtimePath = Join-Path (Get-Package-Source-Dir) $module.runtimeLibrary
+        if (Test-Path -LiteralPath $runtimePath) {
+            Add-PreflightResult -Results $results -Name ("Runtime installer: " + $module.runtimeLibrary) -Status "PASS" -Details $runtimePath
+        }
+        else {
+            Add-PreflightResult -Results $results -Name ("Runtime installer: " + $module.runtimeLibrary) -Status "WARN" -Details ("Missing file: {0}" -f $runtimePath)
         }
     }
 
-    foreach ($wcf in @($webConfigs)) {
-        Write-Verbose ("  Parsing " + $wcf.FullName)
+    try {
+        Validate-InstallParameters
+        Add-PreflightResult -Results $results -Name "Install parameter validation" -Status "PASS" -Details "Source and logging parameters validated."
+    }
+    catch {
+        Add-PreflightResult -Results $results -Name "Install parameter validation" -Status "FAIL" -Details $_.Exception.Message -ErrorRecord $_
+    }
+
+    # VC++ runtime check
+    try {
+        $runtimeLibs = @($modules | ForEach-Object { $_.runtimeLibrary }) | Select-Object -Unique
+        $vcCheck = Check-Runtime-Libraries -runtimeLibraries $runtimeLibs
+        $minVer = $vcCheck.MinimumVersion
+
+        foreach ($arch in @('x64', 'x86')) {
+            $required = ($modules | Where-Object { $_.runtimeLibrary -match $arch }) -ne $null
+            if (-not $required) { continue }
+
+            if ($vcCheck.Detected.$arch) {
+                $matched = ($vcCheck.MatchedPackages | Where-Object { $_ -match "\b$arch\b" }) -join '; '
+                Add-PreflightResult -Results $results -Name "VC++ runtime ($arch)" -Status "PASS" `
+                    -Details "Sufficient package found (>= $minVer): $matched"
+            }
+            else {
+                Add-PreflightResult -Results $results -Name "VC++ runtime ($arch)" -Status "WARN" `
+                    -Details "No VC++ package >= $minVer found for $arch. Install will attempt to install it from the package source."
+            }
+        }
+    }
+    catch {
+        Add-PreflightResult -Results $results -Name "VC++ runtime check" -Status "WARN" `
+            -Details "Unable to enumerate VC++ packages: $($_.Exception.Message)" -ErrorRecord $_
+    }
+
+    if ($paths) {
+        if ((Test-Path -LiteralPath $paths.InstallDir) -and (Test-PathWritable -Path $paths.InstallDir -NoCreate)) {
+            Add-PreflightResult -Results $results -Name "InstallDir writable" -Status "PASS" -Details $paths.InstallDir
+        }
+        else {
+            Add-PreflightResult -Results $results -Name "InstallDir writable" -Status "WARN" -Details ("Path does not yet exist or is not writable without creating it: {0}" -f $paths.InstallDir)
+        }
+
+        if ((Test-Path -LiteralPath $paths.LogDir) -and (Test-PathWritable -Path $paths.LogDir -NoCreate)) {
+            Add-PreflightResult -Results $results -Name "LogDir writable" -Status "PASS" -Details $paths.LogDir
+        }
+        else {
+            Add-PreflightResult -Results $results -Name "LogDir writable" -Status "WARN" -Details ("Path does not yet exist or is not writable without creating it: {0}" -f $paths.LogDir)
+        }
+
+        if ((Test-Path -LiteralPath $paths.StateDir) -and (Test-PathWritable -Path $paths.StateDir -NoCreate)) {
+            Add-PreflightResult -Results $results -Name "StateDir writable" -Status "PASS" -Details $paths.StateDir
+        }
+        else {
+            Add-PreflightResult -Results $results -Name "StateDir writable" -Status "WARN" -Details ("Path does not yet exist or is not writable without creating it: {0}" -f $paths.StateDir)
+        }
+
+        Add-PreflightResult -Results $results -Name "Resolved log file" -Status "PASS" -Details $paths.LogFilePath
+    }
+
+    # Engine connectivity — always at least WARN when unreachable.
+    # EngineCheckStatus is surfaced on Summary so Install-Agent can gate on it
+    # independently from the aggregate ExitCode.
+    $engineCheckStatus = $null
+    if (-not [string]::IsNullOrWhiteSpace($NonameEngineUrl)) {
         try {
-            $doc    = [System.Xml.XmlDocument]::new()
-            $reader = $null
-            try {
-                $settings = [System.Xml.XmlReaderSettings]::new()
-                $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-                $settings.XmlResolver   = $null
-                $reader = [System.Xml.XmlReader]::Create($wcf.FullName, $settings)
-                $doc.Load($reader)
-            } finally {
-                if ($reader) { $reader.Close() }
+            $uri = [Uri]$NonameEngineUrl
+            Add-PreflightResult -Results $results -Name "Engine URL format" -Status "PASS" -Details $uri.AbsoluteUri
+
+            $engineCheck = Test-EngineReachable -Url $NonameEngineUrl -TimeoutSec $EngineConnectivityTimeoutSec
+            if ($engineCheck.Reachable) {
+                $engineCheckStatus = "PASS"
+                Add-PreflightResult -Results $results -Name "Engine connectivity" -Status "PASS" -Details $engineCheck.Details
             }
-
-            # <handlers> <add verb="GET,POST" path="/api/v1/*" ...>
-            $handlers = $doc.SelectNodes("//*[local-name()='handlers']/*[local-name()='add']")
-            foreach ($h in $handlers) {
-                $verbs = $h.GetAttribute("verb")
-                $path  = $h.GetAttribute("path")
-                if (-not $path -or $path -eq '*') { continue }
-                if (-not (Test-ApiPath $path)) { continue }
-
-                $methods = if ($verbs -and $verbs -ne '*') {
-                    $verbs -split ',' | ForEach-Object { $_.Trim().ToUpper() } |
-                        Where-Object { $_ -match '^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$' }
-                } else {
-                    @("GET","POST","PUT","DELETE","PATCH")
+            else {
+                $engineCheckStatus = "WARN"
+                $engineDetails = $engineCheck.Details
+                if ($FailOnWarnings -and -not $script:Force) {
+                    $engineCheckStatus = "FAIL"
+                    $engineDetails = "$($engineCheck.Details) FailOnWarnings is enabled, so engine connectivity is treated as FAIL."
                 }
-
-                foreach ($hn in $hostnames) {
-                    foreach ($method in $methods) {
-                        $key = "$method|$hn|$path"
-                        if ($seen.Add($key)) {
-                            $endpoints.Add([PSCustomObject]@{
-                                Host           = $hn
-                                Path           = $path
-                                Method         = $method
-                                Source         = ("IIS:web.config:" + $wcf.FullName)
-                                Status         = $null
-                                ContentType    = ""
-                                SampleRequest  = ""
-                                SampleResponse = ""
-                            })
-                        }
-                    }
-                }
-            }
-        } catch {
-            Write-Log WARN ("Could not parse " + $wcf.FullName + ": " + $_) "E6004"
-            $parseErrors++
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO ("IIS web.config: " + $endpoints.Count + " endpoints from " + @($webConfigs).Count + " file(s) in " + $elapsed + "s" + $(if ($parseErrors) { " [$parseErrors errors]" }) + ".")
-    return $endpoints
-}
-
-# ===========================================================================
-# NODE.JS DISCOVERY
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# Node SOURCE 1: PM2 / node process logs
-# Looks for Express-style: "GET /api/v1/users 200" or route registration lines
-# ---------------------------------------------------------------------------
-
-function Get-EndpointsFromNodeLogs([string[]]$hostnames) {
-    Write-Header "Node.js Source 1: Process Logs"
-    $t0 = Get-Date
-
-    $logRoots = @()
-    if ($NodeLogPath -and (Test-Path $NodeLogPath)) {
-        $logRoots += $NodeLogPath
-    } else {
-        # PM2 default locations
-        $pm2Home = Join-Path $env:USERPROFILE ".pm2\logs"
-        if (Test-Path $pm2Home) { $logRoots += $pm2Home }
-        $pm2Global = "C:\Users\Public\.pm2\logs"
-        if (Test-Path $pm2Global) { $logRoots += $pm2Global }
-    }
-
-    if (-not $logRoots) {
-        Write-Log INFO "No Node.js log directories found - skipping."
-        return @()
-    }
-
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $results   = [System.Collections.Generic.HashSet[string]]::new()
-    # Express access log pattern: "METHOD /path HTTP/1.x" status or "METHOD /path status"
-    $exprPattern = [string]'(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(/[^\s"]*)\s+(?:HTTP/\S+\s+)?(\d{3})'
-
-    foreach ($root in $logRoots) {
-        $files = @(Get-ChildItem $root -Recurse -Filter "*.log" -ErrorAction SilentlyContinue |
-                   Where-Object { $_.LastWriteTime -ge (Get-Date).AddDays(-$LogDays) })
-        foreach ($file in $files) {
-            $fs = $null; $reader = $null
-            try {
-                $fs     = [System.IO.File]::Open($file.FullName,
-                            [System.IO.FileMode]::Open,
-                            [System.IO.FileAccess]::Read,
-                            [System.IO.FileShare]::ReadWrite)
-                $reader = [System.IO.StreamReader]::new($fs)
-                while (-not $reader.EndOfStream) {
-                    $line = $reader.ReadLine()
-                    $m    = [regex]::Match($line, $exprPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                    if (-not $m.Success) { continue }
-                    $method = $m.Groups[1].Value.ToUpper()
-                    $path   = $m.Groups[2].Value -replace '\?.*',''
-                    if (-not (Test-ApiPath $path)) { continue }
-                    $status = if ($m.Groups[3].Value) { [int]$m.Groups[3].Value } else { $null }
-                    foreach ($hn in $hostnames) {
-                        $key = "$method|$hn|$path"
-                        if ($results.Add($key)) {
-                            $endpoints.Add([PSCustomObject]@{
-                                Host = $hn; Path = $path; Method = $method
-                                Source = "Node:Log"; Status = $status
-                                ContentType = ""; SampleRequest = ""; SampleResponse = ""
-                            })
-                        }
-                    }
-                }
-            } catch {
-                Write-Log WARN ("Node log read error " + $file.Name + ": " + $_) "E7002"
-            } finally {
-                if ($reader) { $reader.Close() }
-                if ($fs)     { $fs.Close() }
+                Add-PreflightResult -Results $results -Name "Engine connectivity" -Status $engineCheckStatus -Details $engineDetails
             }
         }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO ("Node.js logs: " + $endpoints.Count + " endpoints in " + $elapsed + "s.")
-    return $endpoints
-}
-
-# ---------------------------------------------------------------------------
-# Node SOURCE 2: package.json + source file route scanning
-# Scans for Express app.get/post/put/delete/patch('/path', ...) definitions
-# ---------------------------------------------------------------------------
-
-function Get-EndpointsFromNodeSource([string[]]$hostnames) {
-    Write-Header "Node.js Source 2: Source Route Scan"
-    $t0 = Get-Date
-
-    $appRoots = @()
-    if ($NodeAppPath -and (Test-Path $NodeAppPath)) {
-        $appRoots += $NodeAppPath
-    } else {
-        # Common locations
-        foreach ($candidate in @("C:\apps", "C:\inetpub\nodejs", "C:\srv", "C:\www")) {
-            if (Test-Path $candidate) { $appRoots += $candidate }
+        catch {
+            $engineCheckStatus = "FAIL"
+            Add-PreflightResult -Results $results -Name "Engine URL format"   -Status "FAIL" -Details "Engine URL is invalid." -ErrorRecord $_
+            Add-PreflightResult -Results $results -Name "Engine connectivity" -Status "FAIL" -Details "Skipped because engine URL is invalid."
         }
     }
-    if (-not $appRoots) {
-        Write-Log INFO "No Node.js app directories found - skipping."
-        return @()
+
+    $passCount = ($results | Where-Object Status -eq "PASS").Count
+    $warnCount = ($results | Where-Object Status -eq "WARN").Count
+    $failCount = ($results | Where-Object Status -eq "FAIL").Count
+
+    $exitCode = 0
+    if ($failCount -gt 0) { $exitCode = 1 }
+    elseif ($FailOnWarnings -and $warnCount -gt 0) { $exitCode = 1 }
+
+    [PSCustomObject]@{
+        Summary = [PSCustomObject]@{
+            Pass              = $passCount
+            Warn              = $warnCount
+            Fail              = $failCount
+            ExitCode          = $exitCode
+            EngineCheckStatus = $engineCheckStatus
+        }
+        Results = $results
     }
+}
 
-    $endpoints  = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $seen       = [System.Collections.Generic.HashSet[string]]::new()
-    # Match: app.get('/path', ...) router.post('/path', ...) router.all('/path', ...)
-    $routePat   = [string]'(?:app|router)\.(get|post|put|delete|patch|all)\s*\(\s*[''"]([^''"]+)[''"]'
+function New-NonameDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (Test-Path -LiteralPath $Path) { return }
+    if ($script:DryRun) { Write-DryRun "Would create directory '$Path'."; return }
+    New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+}
 
-    foreach ($root in $appRoots) {
-        $jsFiles = @(Get-ChildItem $root -Recurse -Depth 8 -Include "*.js","*.ts","*.mjs" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -notmatch 'node_modules' } |
-                     Select-Object -First 500)
-        foreach ($jsf in $jsFiles) {
-            try {
-                $content = [System.IO.File]::ReadAllText($jsf.FullName)
-                $matches_ = [regex]::Matches($content, $routePat, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                foreach ($m in $matches_) {
-                    $verb = $m.Groups[1].Value.ToLower()
-                    $path = $m.Groups[2].Value
-                    if (-not $path.StartsWith('/')) { $path = '/' + $path }
-                    if (-not (Test-ApiPath $path)) { continue }
-                    $methods = if ($verb -eq 'all') { @("GET","POST","PUT","DELETE","PATCH") } else { @($verb.ToUpper()) }
-                    foreach ($hn in $hostnames) {
-                        foreach ($method in $methods) {
-                            $key = "$method|$hn|$path"
-                            if ($seen.Add($key)) {
-                                $endpoints.Add([PSCustomObject]@{
-                                    Host = $hn; Path = $path; Method = $method
-                                    Source = ("Node:Source:" + $jsf.Name)
-                                    Status = $null; ContentType = ""
-                                    SampleRequest = ""; SampleResponse = ""
-                                })
-                            }
-                        }
-                    }
-                }
-            } catch {
-                Write-Log WARN ("Node source scan error " + $jsf.Name + ": " + $_) "E7002"
+function Get-Install-Dir-Path {
+    param([string]$InstallDir)
+    if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+        return (Join-Path $env:ProgramFiles "Noname Module")
+    }
+    try {
+        return [System.IO.Path]::GetFullPath($InstallDir)
+    }
+    catch {
+        throw "Invalid install directory provided '$InstallDir'"
+    }
+}
+
+function Get-Environment-Variable {
+    param([string]$envName)
+    [System.Environment]::GetEnvironmentVariable($envName, (Get-EnvironmentVariableTarget))
+}
+
+function Set-Environment-Variable {
+    param([string]$envName, [string]$envValue)
+    if ($script:DryRun) {
+        Write-DryRun "Would set $EnvironmentVariableScope environment variable '$envName' to '$envValue'."
+        return
+    }
+    [System.Environment]::SetEnvironmentVariable($envName, $envValue, (Get-EnvironmentVariableTarget))
+}
+
+function Remove-Environment-Variable {
+    param([Parameter(Mandatory = $true)][string]$envName)
+    try {
+        if ($script:DryRun) { Write-DryRun "Would clear $EnvironmentVariableScope environment variable '$envName'."; return }
+        [System.Environment]::SetEnvironmentVariable($envName, $null, (Get-EnvironmentVariableTarget))
+        Write-Host -ForegroundColor Cyan "Environment variable '$envName' cleared."
+    }
+    catch {
+        Write-Host -ForegroundColor Yellow "Warning: Failed to clear environment variable '$envName'. $($_.Exception.Message)"
+    }
+}
+
+function Remove-Item-IfExists {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Recurse
+    )
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            if ($script:DryRun) {
+                $suffix = if ($Recurse) { " recursively" } else { "" }
+                Write-DryRun "Would remove '$Path'$suffix."
+                return
             }
+            if ($Recurse) { Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop }
+            else          { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+            Write-Host -ForegroundColor Cyan "Removed '$Path'."
+        }
+        else {
+            Write-Host -ForegroundColor Yellow "Warning: Path does not exist, skipping '$Path'."
         }
     }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO ("Node.js source: " + $endpoints.Count + " endpoints in " + $elapsed + "s.")
-    return $endpoints
+    catch {
+        Write-Host -ForegroundColor Yellow "Warning: Failed removing '$Path'. $($_.Exception.Message)"
+    }
 }
 
-# ===========================================================================
-# .NET KESTREL / ASP.NET CORE DISCOVERY
-# ===========================================================================
+function Get-Paths { return (Get-Default-Paths) }
 
-function Get-EndpointsFromDotNetLogs([string[]]$hostnames) {
-    Write-Header ".NET Source 1: Kestrel / ASP.NET Core Logs"
-    $t0 = Get-Date
-
-    $logRoots = @()
-    if ($DotNetLogPath -and (Test-Path $DotNetLogPath)) {
-        $logRoots += $DotNetLogPath
-    } else {
-        foreach ($candidate in @(
-            "C:\inetpub\logs",
-            "C:\apps",
-            "C:\srv"
-        )) {
-            if (Test-Path $candidate) { $logRoots += $candidate }
-        }
+function Get-PendingMarkerPath {
+    param([ValidateSet("Install","Uninstall")] [string]$Type)
+    $paths = Get-Paths
+    switch ($Type) {
+        "Install"   { return $paths.PendingInstallMarker }
+        "Uninstall" { return $paths.PendingUninstallMarker }
     }
-
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $results   = [System.Collections.Generic.HashSet[string]]::new()
-    # Kestrel stdout: "info: Microsoft.AspNetCore.Hosting... Request starting HTTP/1.1 GET https://host/path"
-    # Also standard combined log format emitted by some ASP.NET middlewares
-    $kestrelPat  = [string]'Request starting \S+ (GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+https?://([^/\s]+)(/[^\s]*)'
-    $combinedPat = [string]'"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(/[^\s]*)\s+HTTP'
-
-    foreach ($root in $logRoots) {
-        $files = @(Get-ChildItem $root -Recurse -Filter "*.log" -ErrorAction SilentlyContinue |
-                   Where-Object { $_.LastWriteTime -ge (Get-Date).AddDays(-$LogDays) } |
-                   Select-Object -First 50)
-        foreach ($file in $files) {
-            $fs = $null; $reader = $null
-            try {
-                $fs     = [System.IO.File]::Open($file.FullName,
-                            [System.IO.FileMode]::Open,
-                            [System.IO.FileAccess]::Read,
-                            [System.IO.FileShare]::ReadWrite)
-                $reader = [System.IO.StreamReader]::new($fs)
-                while (-not $reader.EndOfStream) {
-                    $line = $reader.ReadLine()
-                    $m    = [regex]::Match($line, $kestrelPat, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                    if ($m.Success) {
-                        $method  = $m.Groups[1].Value.ToUpper()
-                        $logHost = $m.Groups[2].Value.ToLower() -replace ':\d+$',''
-                        $path    = $m.Groups[3].Value -replace '\?.*',''
-                        if (Test-ApiPath $path) {
-                            $key = "$method|$logHost|$path"
-                            if ($results.Add($key)) {
-                                $endpoints.Add([PSCustomObject]@{
-                                    Host = $logHost; Path = $path; Method = $method
-                                    Source = ".NET:KestrelLog"; Status = $null
-                                    ContentType = ""; SampleRequest = ""; SampleResponse = ""
-                                })
-                            }
-                        }
-                        continue
-                    }
-                    $m = [regex]::Match($line, $combinedPat)
-                    if ($m.Success) {
-                        $method = $m.Groups[1].Value.ToUpper()
-                        $path   = $m.Groups[2].Value -replace '\?.*',''
-                        if (-not (Test-ApiPath $path)) { continue }
-                        foreach ($hn in $hostnames) {
-                            $key = "$method|$hn|$path"
-                            if ($results.Add($key)) {
-                                $endpoints.Add([PSCustomObject]@{
-                                    Host = $hn; Path = $path; Method = $method
-                                    Source = ".NET:Log"; Status = $null
-                                    ContentType = ""; SampleRequest = ""; SampleResponse = ""
-                                })
-                            }
-                        }
-                    }
-                }
-            } catch {
-                Write-Log WARN (".NET log read error " + $file.Name + ": " + $_) "E8002"
-            } finally {
-                if ($reader) { $reader.Close() }
-                if ($fs)     { $fs.Close() }
-            }
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO (".NET logs: " + $endpoints.Count + " endpoints in " + $elapsed + "s.")
-    return $endpoints
 }
 
-function Get-EndpointsFromDotNetSource([string[]]$hostnames) {
-    Write-Header ".NET Source 2: launchSettings.json / Route Attributes"
-    $t0 = Get-Date
+function Write-PendingState {
+    param(
+        [ValidateSet("Install","Uninstall")] [string]$Type,
+        [string]$Reason
+    )
+    $paths = Get-Paths
+    New-NonameDirectory -Path $paths.StateDir
 
-    $appRoots = @()
-    if ($DotNetAppPath -and (Test-Path $DotNetAppPath)) {
-        $appRoots += $DotNetAppPath
-    } else {
-        foreach ($candidate in @("C:\apps", "C:\inetpub\wwwroot", "C:\srv")) {
-            if (Test-Path $candidate) { $appRoots += $candidate }
-        }
-    }
+    $markerPath = Get-PendingMarkerPath -Type $Type
+    $payload = @{
+        Type         = $Type
+        ComputerName = $env:COMPUTERNAME
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString("o")
+        Reason       = $Reason
+    } | ConvertTo-Json -Depth 4
 
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $seen      = [System.Collections.Generic.HashSet[string]]::new()
-    # [HttpGet("/api/v1/users")]  [Route("api/[controller]")]
-    $attrPat   = [string]'\[Http(Get|Post|Put|Delete|Patch)\s*\(\s*"([^"]+)"\s*\)\]'
-    $routePat  = [string]'\[Route\s*\(\s*"([^"]+)"\s*\)\]'
-
-    foreach ($root in $appRoots) {
-        $csFiles = @(Get-ChildItem $root -Recurse -Depth 8 -Include "*.cs" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -notmatch '\\obj\\|\\bin\\' } |
-                     Select-Object -First 500)
-        foreach ($csf in $csFiles) {
-            try {
-                $content  = [System.IO.File]::ReadAllText($csf.FullName)
-                $attrMs   = [regex]::Matches($content, $attrPat, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                foreach ($m in $attrMs) {
-                    $method = $m.Groups[1].Value.ToUpper()
-                    $path   = $m.Groups[2].Value
-                    if (-not $path.StartsWith('/')) { $path = '/' + $path }
-                    # Normalise [controller] / [action] tokens
-                    $path = $path -replace '\[controller\]', '{controller}' -replace '\[action\]', '{action}'
-                    if (-not (Test-ApiPath $path)) { continue }
-                    foreach ($hn in $hostnames) {
-                        $key = "$method|$hn|$path"
-                        if ($seen.Add($key)) {
-                            $endpoints.Add([PSCustomObject]@{
-                                Host = $hn; Path = $path; Method = $method
-                                Source = (".NET:Source:" + $csf.Name)
-                                Status = $null; ContentType = ""
-                                SampleRequest = ""; SampleResponse = ""
-                            })
-                        }
-                    }
-                }
-            } catch {
-                Write-Log WARN (".NET source scan error " + $csf.Name + ": " + $_) "E8002"
-            }
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO (".NET source: " + $endpoints.Count + " endpoints in " + $elapsed + "s.")
-    return $endpoints
+    if ($script:DryRun) { Write-DryRun "Would write pending state '$Type' to '$markerPath'."; return }
+    Set-Content -LiteralPath $markerPath -Value $payload -Encoding UTF8
 }
 
-# ===========================================================================
-# PYTHON (FLASK / FASTAPI / DJANGO) DISCOVERY
-# ===========================================================================
-
-function Get-EndpointsFromPythonLogs([string[]]$hostnames) {
-    Write-Header "Python Source 1: WSGI/ASGI Logs"
-    $t0 = Get-Date
-
-    $logRoots = @()
-    if ($PythonLogPath -and (Test-Path $PythonLogPath)) {
-        $logRoots += $PythonLogPath
-    } else {
-        foreach ($candidate in @("C:\apps", "C:\srv", "C:\inetpub\logs")) {
-            if (Test-Path $candidate) { $logRoots += $candidate }
-        }
-    }
-
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $results   = [System.Collections.Generic.HashSet[string]]::new()
-    # Gunicorn/Waitress/uvicorn: "GET /api/v1/users HTTP/1.1" 200
-    $accessPat  = [string]'"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(/[^\s"]*)\s+HTTP/[^"]*"\s+(\d{3})'
-    # uvicorn info log: INFO:     127.0.0.1:port - "GET /path HTTP/1.1" 200
-    $uvicornPat = [string]'"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(/[^\s"]*)\s+HTTP'
-
-    foreach ($root in $logRoots) {
-        $files = @(Get-ChildItem $root -Recurse -Filter "*.log" -ErrorAction SilentlyContinue |
-                   Where-Object { $_.LastWriteTime -ge (Get-Date).AddDays(-$LogDays) } |
-                   Select-Object -First 50)
-        foreach ($file in $files) {
-            $fs = $null; $reader = $null
-            try {
-                $fs     = [System.IO.File]::Open($file.FullName,
-                            [System.IO.FileMode]::Open,
-                            [System.IO.FileAccess]::Read,
-                            [System.IO.FileShare]::ReadWrite)
-                $reader = [System.IO.StreamReader]::new($fs)
-                while (-not $reader.EndOfStream) {
-                    $line = $reader.ReadLine()
-                    $m    = [regex]::Match($line, $accessPat)
-                    if (-not $m.Success) { $m = [regex]::Match($line, $uvicornPat) }
-                    if (-not $m.Success) { continue }
-                    $method = $m.Groups[1].Value.ToUpper()
-                    $path   = $m.Groups[2].Value -replace '\?.*',''
-                    if (-not (Test-ApiPath $path)) { continue }
-                    $status = if ($m.Groups[3].Success -and $m.Groups[3].Value) { [int]$m.Groups[3].Value } else { $null }
-                    foreach ($hn in $hostnames) {
-                        $key = "$method|$hn|$path"
-                        if ($results.Add($key)) {
-                            $endpoints.Add([PSCustomObject]@{
-                                Host = $hn; Path = $path; Method = $method
-                                Source = "Python:Log"; Status = $status
-                                ContentType = ""; SampleRequest = ""; SampleResponse = ""
-                            })
-                        }
-                    }
-                }
-            } catch {
-                Write-Log WARN ("Python log read error " + $file.Name + ": " + $_) "E9002"
-            } finally {
-                if ($reader) { $reader.Close() }
-                if ($fs)     { $fs.Close() }
-            }
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO ("Python logs: " + $endpoints.Count + " endpoints in " + $elapsed + "s.")
-    return $endpoints
-}
-
-function Get-EndpointsFromPythonSource([string[]]$hostnames) {
-    Write-Header "Python Source 2: Flask/FastAPI Route Scan"
-    $t0 = Get-Date
-
-    $appRoots = @()
-    if ($PythonAppPath -and (Test-Path $PythonAppPath)) {
-        $appRoots += $PythonAppPath
-    } else {
-        foreach ($candidate in @("C:\apps", "C:\srv", "C:\inetpub\python")) {
-            if (Test-Path $candidate) { $appRoots += $candidate }
-        }
-    }
-
-    $endpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $seen      = [System.Collections.Generic.HashSet[string]]::new()
-    # Flask:   @app.route('/path', methods=['GET','POST'])
-    # FastAPI: @app.get('/path')  @router.post('/path')
-    $flaskPat   = [string]'@\w+\.route\s*\(\s*''([^'']+)''[^)]*methods\s*=\s*\[([^\]]+)\]'
-    $fastapiPat = [string]'@(?:app|router)\.(get|post|put|delete|patch)\s*\(\s*''([^'']+)'''
-
-    foreach ($root in $appRoots) {
-        $pyFiles = @(Get-ChildItem $root -Recurse -Include "*.py" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -notmatch '\\__pycache__\\|\\venv\\|\\\.venv\\' } |
-                     Select-Object -First 500)
-        foreach ($pyf in $pyFiles) {
-            try {
-                $content = [System.IO.File]::ReadAllText($pyf.FullName)
-
-                # Flask routes
-                $flaskMs = [regex]::Matches($content, $flaskPat, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                foreach ($m in $flaskMs) {
-                    $path    = $m.Groups[1].Value
-                    if (-not $path.StartsWith('/')) { $path = '/' + $path }
-                    $methods = $m.Groups[2].Value -split ',' |
-                               ForEach-Object { $_.Trim().Trim('"').Trim("'").ToUpper() } |
-                               Where-Object { $_ -match '^(GET|POST|PUT|DELETE|PATCH)$' }
-                    if (-not (Test-ApiPath $path)) { continue }
-                    foreach ($hn in $hostnames) {
-                        foreach ($method in $methods) {
-                            $key = "$method|$hn|$path"
-                            if ($seen.Add($key)) {
-                                $endpoints.Add([PSCustomObject]@{
-                                    Host = $hn; Path = $path; Method = $method
-                                    Source = ("Python:Flask:" + $pyf.Name)
-                                    Status = $null; ContentType = ""
-                                    SampleRequest = ""; SampleResponse = ""
-                                })
-                            }
-                        }
-                    }
-                }
-
-                # FastAPI routes
-                $fastapiMs = [regex]::Matches($content, $fastapiPat, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                foreach ($m in $fastapiMs) {
-                    $method = $m.Groups[1].Value.ToUpper()
-                    $path   = $m.Groups[2].Value
-                    if (-not $path.StartsWith('/')) { $path = '/' + $path }
-                    if (-not (Test-ApiPath $path)) { continue }
-                    foreach ($hn in $hostnames) {
-                        $key = "$method|$hn|$path"
-                        if ($seen.Add($key)) {
-                            $endpoints.Add([PSCustomObject]@{
-                                Host = $hn; Path = $path; Method = $method
-                                Source = ("Python:FastAPI:" + $pyf.Name)
-                                Status = $null; ContentType = ""
-                                SampleRequest = ""; SampleResponse = ""
-                            })
-                        }
-                    }
-                }
-            } catch {
-                Write-Log WARN ("Python source scan error " + $pyf.Name + ": " + $_) "E9002"
-            }
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO ("Python source: " + $endpoints.Count + " endpoints in " + $elapsed + "s.")
-    return $endpoints
-}
-
-# ---------------------------------------------------------------------------
-# Deduplication and merge
-# ---------------------------------------------------------------------------
-
-function Merge-Endpoints([array]$all) {
-    Write-Header "Deduplicating"
-    $t0     = Get-Date
-    $index  = [System.Collections.Generic.Dictionary[string,int]]::new()
-    $unique = [System.Collections.Generic.List[PSCustomObject]]::new()
-
-    foreach ($ep in $all) {
-        $normPath = (($ep.Path -replace '\?.*','') -replace '//+', '/').ToLower()
-        $key      = "$($ep.Method.ToUpper())|$($ep.Host.ToLower())|$normPath"
-
-        if (-not $index.ContainsKey($key)) {
-            $index[$key] = $unique.Count
-            $unique.Add([PSCustomObject]@{
-                Host           = $ep.Host.ToLower()
-                Path           = $normPath
-                Method         = $ep.Method.ToUpper()
-                Source         = $ep.Source
-                Status         = $ep.Status
-                ContentType    = $ep.ContentType
-                SampleRequest  = $ep.SampleRequest
-                SampleResponse = $ep.SampleResponse
-            })
-        } else {
-            $existing = $unique[$index[$key]]
-            if (-not $existing.Status         -and $ep.Status)         { $existing.Status         = $ep.Status }
-            if (-not $existing.ContentType    -and $ep.ContentType)    { $existing.ContentType    = $ep.ContentType }
-            if (-not $existing.SampleRequest  -and $ep.SampleRequest)  { $existing.SampleRequest  = $ep.SampleRequest }
-            if (-not $existing.SampleResponse -and $ep.SampleResponse) { $existing.SampleResponse = $ep.SampleResponse }
-            if ($ep.Source -eq "AccessLog") { $existing.Source = "AccessLog" }
-        }
-    }
-
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    Write-Log INFO "Dedup: $($all.Count) raw -> $($unique.Count) unique in ${elapsed}s."
-    return $unique
-}
-
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
-
-function Export-Inventory([array]$endpoints, [string]$format, [string]$path) {
-    switch ($format) {
-        "CSV" {
-            $endpoints | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
-            Write-Log INFO "CSV written to: $path"
-        }
-        "JSON" {
-            $endpoints | ConvertTo-Json -Depth 3 | Set-Content -Path $path -Encoding UTF8
-            Write-Log INFO "JSON written to: $path"
-        }
-        default {
-            Write-Header "API Inventory"
-            $endpoints | Format-Table Host, Method, Path, Status, ContentType, Source -AutoSize
+function Clear-PendingState {
+    param([ValidateSet("Install","Uninstall","All")] [string]$Type)
+    $paths = Get-Paths
+    switch ($Type) {
+        "Install"   { Remove-Item-IfExists -Path $paths.PendingInstallMarker }
+        "Uninstall" { Remove-Item-IfExists -Path $paths.PendingUninstallMarker }
+        "All" {
+            Remove-Item-IfExists -Path $paths.PendingInstallMarker
+            Remove-Item-IfExists -Path $paths.PendingUninstallMarker
         }
     }
 }
 
-# ---------------------------------------------------------------------------
-# Engine POST (bulk synthetic packet pairs)
-# ---------------------------------------------------------------------------
-
-function Build-Packet([PSCustomObject]$ep, [long]$ts, [string]$localIp,
-                      [int]$sourceType, [int]$sourceIndex, [string]$sourceKey) {
-    $ct = if ($ep.ContentType) { $ep.ContentType } else { "application/json" }
-    return [ordered]@{
-        ip     = [ordered]@{ v = "4"; src = "127.0.0.1"; dst = $localIp }
-        tcp    = [ordered]@{ src = 0; dst = $Port }
-        http   = [ordered]@{
-            v        = "1.1"
-            request  = [ordered]@{
-                ts      = $ts
-                method  = $ep.Method
-                url     = $ep.Path
-                headers = [ordered]@{ host = $ep.Host }
-                body    = ""
-            }
-            response = [ordered]@{
-                ts      = $ts
-                status  = if ($ep.Status) { $ep.Status } else { 200 }
-                headers = [ordered]@{ "content-type" = $ct }
-                body    = ""
-            }
-        }
-        source = [ordered]@{
-            type  = $sourceType
-            index = $sourceIndex
-            key   = $sourceKey
-        }
+function Get-PendingActivationStatus {
+    $paths = Get-Paths
+    [PSCustomObject]@{
+        PendingInstall   = Test-Path -LiteralPath $paths.PendingInstallMarker
+        PendingUninstall = Test-Path -LiteralPath $paths.PendingUninstallMarker
+        InstallMarker    = $paths.PendingInstallMarker
+        UninstallMarker  = $paths.PendingUninstallMarker
     }
 }
 
-function Send-ToEngine([array]$endpoints, [string]$engineUrl,
-                       [int]$sourceType, [int]$sourceIndex, [string]$sourceKey,
-                       [bool]$skipTls) {
+function Create-Noname-Log {
+    $paths = Get-Paths
+    New-NonameDirectory -Path $paths.LogDir
 
-    Write-Header "Posting to Engine: $engineUrl"
-
-    $invokeArgs = @{
-        Uri         = $engineUrl
-        Method      = 'POST'
-        ContentType = 'application/json'
-        ErrorAction = 'Stop'
+    if ($script:DryRun) {
+        Write-DryRun "Would ensure log file exists at '$($paths.LogFilePath)'."
     }
-    if ($skipTls) {
-        Write-Log WARN "TLS certificate verification disabled. Test environments only."
+    else {
+        if (-not (Test-Path -LiteralPath $paths.LogFilePath)) {
+            New-Item -ItemType File -Path $paths.LogFilePath -Force -ErrorAction Stop | Out-Null
+        }
     }
 
-    Test-EngineConnectivity $engineUrl $skipTls
+    Set-Environment-Variable -envName "NONAME_LOG_FILE_LOCATION" -envValue $paths.LogFilePath
+    Write-Host -ForegroundColor Cyan "NONAME_LOG_FILE_LOCATION set to '$($paths.LogFilePath)'"
+}
 
-    $ts      = [long][double]::Parse((Get-Date -UFormat %s))
-    $localIp = (Get-NetIPAddress -AddressFamily IPv4 |
-                Where-Object { $_.InterfaceAlias -notmatch 'Loopback' } |
-                Select-Object -First 1).IPAddress
-    if (-not $localIp) { $localIp = "127.0.0.1" }
+function Clear-Noname-Log-State {
+    Remove-Environment-Variable -envName "NONAME_LOG_FILE_LOCATION"
+}
 
-    $packets = [System.Collections.Generic.List[object]]::new()
-    foreach ($ep in $endpoints) {
-        if ($ep.Method -eq "UNKNOWN") { continue }
-        $packets.Add((Build-Packet $ep $ts $localIp $sourceType $sourceIndex $sourceKey))
+function Set-Source-Parameters {
+    foreach ($key in $sourceParams.Keys) {
+        Set-Environment-Variable -envName $key -envValue $sourceParams[$key]
+    }
+}
+
+function Clear-Noname-Source-Parameters {
+    foreach ($key in $sourceParams.Keys) {
+        Remove-Environment-Variable -envName $key
+    }
+    Remove-Environment-Variable -envName $dir
+    Remove-Environment-Variable -envName "AZURE_INSTANCE_METADATA"
+}
+
+function Set-Azure-Metadata {
+    if (-not $EnableAzureMetadata) { return }
+
+    $metadataValue = $null
+    try {
+        $headers = @{ Metadata = "true" }
+        $uri = "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+        $response = Invoke-WebRequest -Uri $uri -Method Get -Headers $headers -TimeoutSec $AzureMetadataTimeoutSec -UseBasicParsing -ErrorAction Stop
+        if ($response.Content) { $metadataValue = [string]$response.Content }
+    }
+    catch {
+        Write-Host -ForegroundColor Yellow "Warning: Failed retrieving Azure metadata. $($_.Exception.Message)"
     }
 
-    Write-Log INFO "Sending $($packets.Count) packets in batches of $BatchSize..."
+    if (-not [string]::IsNullOrWhiteSpace($metadataValue)) {
+        Set-Environment-Variable -envName "AZURE_INSTANCE_METADATA" -envValue $metadataValue
+    }
+}
 
-    $sent         = 0
-    $failed       = 0
-    $batchNum     = 0
-    $batchFailed  = 0
-    $t0           = Get-Date
+function Copy-Noname-Module-To-Dir {
+    param([Parameter(Mandatory = $true)][string]$moduleDir)
 
-    for ($i = 0; $i -lt $packets.Count; $i += $BatchSize) {
-        $batchNum++
-        $batch              = $packets[$i .. [Math]::Min($i + $BatchSize - 1, $packets.Count - 1)]
-        $invokeArgs['Body'] = ($batch | ConvertTo-Json -Depth 8 -Compress)
+    New-NonameDirectory -Path $moduleDir
 
+    foreach ($module in $modules) {
+        $dllName = $module.dllName
+        $sourceDllPath = Join-Path (Get-Package-Source-Dir) $dllName
+        $modulePath = Join-Path $moduleDir $dllName
+
+        if (-not (Test-Path -LiteralPath $sourceDllPath)) {
+            throw "Required module file not found: $sourceDllPath"
+        }
+
+        if ((-not $script:Force) -and (Test-Path -LiteralPath $modulePath)) {
+            Write-Host -ForegroundColor Cyan "'$dllName' already exists at '$modulePath'. Skipping copy."
+            continue
+        }
+
+        if ($script:DryRun) {
+            Write-DryRun "Would copy '$sourceDllPath' to '$modulePath'. Force=$script:Force"
+        }
+        else {
+            Copy-Item -Path $sourceDllPath -Destination $modulePath -Force -ErrorAction Stop
+            Write-Host -ForegroundColor Cyan "'$dllName' was copied to '$modulePath'."
+        }
+    }
+
+    Set-Environment-Variable -envName $dir -envValue $moduleDir
+}
+
+function Remove-Noname-Module-From-Dir {
+    param([string]$moduleDir)
+
+    if (-not $moduleDir -or -not (Test-Path -LiteralPath $moduleDir)) {
+        Write-Host -ForegroundColor Yellow "Warning: Module directory does not exist. '$moduleDir'"
+        return
+    }
+
+    foreach ($module in $modules) {
+        $dllName = $module.dllName
+        $modulePath = Join-Path $moduleDir $dllName
         try {
-            $bt0  = Get-Date
-            $null = if ($skipTls) { Invoke-RestSkipTls $invokeArgs } else { Invoke-RestMethod @invokeArgs }
-            $bms  = [math]::Round(((Get-Date) - $bt0).TotalMilliseconds)
-            $sent += $batch.Count
-            Write-Verbose "  Batch $batchNum/$([Math]::Ceiling($packets.Count / $BatchSize)): $($batch.Count) packets in ${bms}ms"
-        } catch {
-            Write-Log WARN "Batch $batchNum failed: $_" "E2002"
-            $failed      += $batch.Count
-            $batchFailed++
+            if (Test-Path -LiteralPath $modulePath) {
+                if ($script:DryRun) { Write-DryRun "Would remove '$modulePath'." }
+                else {
+                    Remove-Item -LiteralPath $modulePath -Force -ErrorAction Stop
+                    Write-Host -ForegroundColor Cyan "'$dllName' was removed from '$modulePath'."
+                }
+            }
+            else {
+                Write-Host -ForegroundColor Yellow "Warning: '$dllName' not found at '$modulePath'."
+            }
+        }
+        catch {
+            Write-Host -ForegroundColor Yellow "Warning: Failed removing '$modulePath'. $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-VcRedistEntries {
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $hives   = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WoW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($hive in $hives) {
+        try {
+            Get-ChildItem $hive -ErrorAction SilentlyContinue | ForEach-Object {
+                $n = $_.GetValue('DisplayName')
+                $v = $_.GetValue('DisplayVersion')
+                if (-not [string]::IsNullOrWhiteSpace($n) -and $n -match 'Microsoft Visual C\+\+.*Redistributable') {
+                    $entries.Add([PSCustomObject]@{ DisplayName = $n; DisplayVersion = $v; RegistryKey = $_.PSPath }) | Out-Null
+                }
+            }
+        }
+        catch { Write-Host -ForegroundColor Yellow "Warning: Could not enumerate registry hive '$hive'. $($_.Exception.Message)" }
+    }
+    return $entries
+}
+
+function Get-VcRedistMinimumVersion { return [Version]'14.16.0.0' }
+
+function Test-VcRedistVersionSufficient {
+    param([Parameter(Mandatory=$true)][string]$DisplayVersion, [Parameter(Mandatory=$true)][Version]$MinimumVersion)
+    try { return ([Version]$DisplayVersion -ge $MinimumVersion) } catch { return $false }
+}
+
+function Check-Runtime-Libraries {
+    param([string[]]$runtimeLibraries)
+
+    Write-Host -ForegroundColor Cyan "`nChecking for Visual C++ Redistributable packages"
+
+    $requiredArchitectures = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($lib in $runtimeLibraries) {
+        if ($lib -match 'x64') { [void]$requiredArchitectures.Add('x64') }
+        elseif ($lib -match 'x86') { [void]$requiredArchitectures.Add('x86') }
+    }
+
+    $minimumVersion = Get-VcRedistMinimumVersion
+    $detected = @{ x86 = $false; x64 = $false }
+    $matchedPackages = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($entry in (Get-VcRedistEntries)) {
+        $displayName    = $entry.DisplayName
+        $displayVersion = $entry.DisplayVersion
+
+        if ($displayName -match '\bDebug\b') { Write-Host -ForegroundColor Yellow "Ignoring debug VC++ package: $displayName"; continue }
+
+        $arch = $null
+        if    ($displayName -match '\bARM64\b') { $arch = 'ARM64' }
+        elseif ($displayName -match '\bx64\b')  { $arch = 'x64' }
+        elseif ($displayName -match '\bx86\b')  { $arch = 'x86' }
+
+        if ($null -eq $arch) { Write-Host -ForegroundColor Yellow "Warning: VC++ package with unrecognized architecture, skipping: $displayName"; continue }
+        if ($arch -eq 'ARM64') { Write-Host -ForegroundColor Yellow "Skipping ARM64 VC++ package (not supported by IIS native module): $displayName"; continue }
+        if ([string]::IsNullOrWhiteSpace($displayVersion)) { Write-Host -ForegroundColor Yellow "Warning: VC++ package has no DisplayVersion, skipping: $displayName"; continue }
+        if (-not (Test-VcRedistVersionSufficient -DisplayVersion $displayVersion -MinimumVersion $minimumVersion)) {
+            Write-Host -ForegroundColor Yellow ("Warning: VC++ package version $displayVersion is below minimum $minimumVersion - too old: $displayName")
+            continue
+        }
+
+        $detected[$arch] = $true
+        $matchedPackages.Add("$displayName ($displayVersion)")
+        Write-Host -ForegroundColor Cyan "Detected sufficient VC++ Redistributable for ${arch}: $displayName ($displayVersion)"
+    }
+
+    $missing = [System.Collections.Generic.List[string]]::new()
+    foreach ($arch in $requiredArchitectures) {
+        if (-not $detected[$arch]) { $missing.Add($arch) }
+    }
+
+    [PSCustomObject]@{
+        AllPresent           = ($missing.Count -eq 0)
+        MissingArchitectures = $missing
+        MinimumVersion       = $minimumVersion.ToString()
+        Detected             = [PSCustomObject]$detected
+        MatchedPackages      = $matchedPackages
+    }
+}
+
+function Install-Runtime-Libraries {
+    $runtimeLibraries = [System.Collections.Generic.List[string]]::new()
+    foreach ($module in $modules) {
+        if (-not [string]::IsNullOrWhiteSpace($module.runtimeLibrary)) {
+            if (-not $runtimeLibraries.Contains($module.runtimeLibrary)) {
+                $runtimeLibraries.Add($module.runtimeLibrary)
+            }
         }
     }
 
-    $elapsed = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2)
-    $Script:Telemetry['PacketsSent']    = $sent
-    $Script:Telemetry['PacketsFailed']  = $failed
-    $Script:Telemetry['BatchesSent']    = $batchNum - $batchFailed
-    $Script:Telemetry['BatchesFailed']  = $batchFailed
+    $runtimeCheck = Check-Runtime-Libraries -runtimeLibraries $runtimeLibraries
+    $minimumVersion = $runtimeCheck.MinimumVersion
 
-    $color = if ($failed -eq 0) { "Green" } else { "Yellow" }
-    Write-Host "  Sent: $sent  Failed: $failed  Duration: ${elapsed}s" -ForegroundColor $color
-}
+    foreach ($runtimeLibrary in $runtimeLibraries) {
+        if ($runtimeLibrary -match 'debug') { throw "Debug VC++ runtime installer is not allowed: $runtimeLibrary" }
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+        $targetArch = if ($runtimeLibrary -match 'x64') { 'x64' } elseif ($runtimeLibrary -match 'x86') { 'x86' } else { $null }
+        if ($null -eq $targetArch) {
+            Write-Host -ForegroundColor Yellow "Warning: Unable to determine runtime architecture from '$runtimeLibrary'. Skipping."
+            continue
+        }
 
-Write-Header "Hostname Discovery"
-$catHome = Resolve-CatalinaHome
-$Script:Telemetry['CatalinaHome'] = if ($catHome) { $catHome } else { "not found" }
+        $shouldInstall = $script:Force -or (-not $runtimeCheck.Detected.$targetArch)
+        if (-not $shouldInstall) {
+            Write-Host -ForegroundColor Cyan "Skipping runtime '$runtimeLibrary' - sufficient $targetArch package (>= $minimumVersion) already installed."
+            continue
+        }
 
-$hostsFileNames = @(Resolve-LocalHostnames)
-$serverXmlNames = if ($catHome) { @(Resolve-HostnamesFromServerXml $catHome) } else { @() }
-$iisNames       = if (-not $SkipIIS) { @(Get-HostnamesFromIIS) } else { @() }
+        $runtimePath = Join-Path (Get-Package-Source-Dir) $runtimeLibrary
+        if (-not (Test-Path -LiteralPath $runtimePath)) { throw "Runtime installer not found: $runtimePath" }
 
-$seenHn    = [System.Collections.Generic.HashSet[string]]::new()
-$hostnames = [System.Collections.Generic.List[string]]::new()
-foreach ($n in ($hostsFileNames + $serverXmlNames + $iisNames)) {
-    if ($n -and $seenHn.Add($n.ToLower())) { $hostnames.Add($n.ToLower()) }
-}
-if ($hostnames.Count -eq 0) { $hostnames.Add("localhost") }
-Write-Log INFO "Combined hostnames: $($hostnames -join ', ')"
-
-$hostnames = $hostnames.ToArray()
-$all       = [System.Collections.Generic.List[PSCustomObject]]::new()
-
-# --- Tomcat ---
-if ($catHome) {
-    Write-Log INFO "Tomcat home: $catHome"
-    foreach ($ep in @(Get-EndpointsFromLogs   $catHome))            { $all.Add($ep) }
-    foreach ($ep in @(Get-EndpointsFromWebXml $catHome $hostnames)) { $all.Add($ep) }
-    foreach ($ep in @(Get-EndpointsFromWars   $catHome $hostnames)) { $all.Add($ep) }
-} else {
-    Write-Log WARN "Skipping Tomcat discovery - home not found." "E5002"
-}
-
-# --- IIS ---
-if (-not $SkipIIS) {
-    foreach ($ep in @(Get-EndpointsFromIISLogs      $hostnames)) { $all.Add($ep) }
-    foreach ($ep in @(Get-EndpointsFromIISWebConfig $hostnames)) { $all.Add($ep) }
-}
-
-# --- Node.js ---
-if (-not $SkipNode) {
-    foreach ($ep in @(Get-EndpointsFromNodeLogs   $hostnames)) { $all.Add($ep) }
-    foreach ($ep in @(Get-EndpointsFromNodeSource $hostnames)) { $all.Add($ep) }
-}
-
-# --- .NET Kestrel / ASP.NET Core ---
-if (-not $SkipDotNet) {
-    foreach ($ep in @(Get-EndpointsFromDotNetLogs   $hostnames)) { $all.Add($ep) }
-    foreach ($ep in @(Get-EndpointsFromDotNetSource $hostnames)) { $all.Add($ep) }
-}
-
-# --- Python (Flask / FastAPI / Django) ---
-if (-not $SkipPython) {
-    foreach ($ep in @(Get-EndpointsFromPythonLogs   $hostnames)) { $all.Add($ep) }
-    foreach ($ep in @(Get-EndpointsFromPythonSource $hostnames)) { $all.Add($ep) }
-}
-
-# --- Netstat (all runtimes) ---
-foreach ($ep in @(Get-EndpointsFromNetstat $Port)) { $all.Add($ep) }
-
-$Script:Telemetry['EndpointsRaw'] = $all.Count
-$inventory = @(Merge-Endpoints $all.ToArray())
-$Script:Telemetry['EndpointsUnique'] = $inventory.Count
-
-if ($inventory.Count -eq 0) {
-    Write-Log WARN "No API endpoints discovered." "E5001"
-    Exit-Script 0
-}
-
-if ($OutputFormat -ne "Console" -and -not $OutputPath) {
-    Write-Log ERROR "-OutputPath is required when -OutputFormat is '$OutputFormat'." "E1005"
-    Exit-Script 1
-}
-
-Export-Inventory $inventory $OutputFormat $OutputPath
-
-if ($DynatraceUrl -and $DynatraceToken) {
-    Send-EndpointsToDynatrace $inventory
-}
-
-if ($EngineUrl) {
-    if (-not $SourceKey) {
-        Write-Log ERROR "-SourceKey is required when -EngineUrl is provided." "E1004"
-        Exit-Script 1
+        if ($script:DryRun) {
+            Write-DryRun "Would install runtime library '$runtimeLibrary' from '$runtimePath' with '$RuntimeInstallArgs'. Force=$script:Force"
+        }
+        else {
+            Write-Host -ForegroundColor Cyan "Installing runtime library '$runtimeLibrary'. Force=$script:Force"
+            $proc = Start-Process -FilePath $runtimePath -ArgumentList $RuntimeInstallArgs -Wait -PassThru
+            if ($proc.ExitCode -notin @(0, 3010, 1638)) { throw "Runtime installer '$runtimeLibrary' failed with exit code $($proc.ExitCode)." }
+            if ($proc.ExitCode -eq 3010) { Write-Host -ForegroundColor Yellow "Warning: Runtime '$runtimeLibrary' requires a reboot to complete." }
+        }
     }
-    Send-ToEngine $inventory $EngineUrl $SourceType $SourceIndex $SourceKey $SkipTlsVerify.IsPresent
+
+    if (-not $script:Force -and $runtimeCheck.AllPresent) {
+        Write-Host -ForegroundColor Green "Success: All required Visual C++ Redistributables (>= $minimumVersion) were found."
+    }
 }
 
-Exit-Script 0
+function Get-IISModuleRegistered {
+    param([string]$ModuleName)
+    try {
+        if (Get-Command Get-WebConfigurationProperty -ErrorAction SilentlyContinue) {
+            $result = Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/globalModules/add[@name='$ModuleName']" -Name "." -ErrorAction SilentlyContinue
+            return ($null -ne $result)
+        }
+        elseif (Test-Path -LiteralPath $appCmd) {
+            $output = & $appCmd list config -section:system.webServer/globalModules 2>$null
+            return ($output -match [regex]::Escape($ModuleName))
+        }
+        return $false
+    }
+    catch { return $false }
+}
+
+function Install-Global-IIS-Modules {
+    param([Parameter(Mandatory = $true)][string]$ModuleDir)
+
+    foreach ($module in $modules) {
+        $dllPath = Join-Path $ModuleDir $module.dllName
+        if (-not (Test-Path -LiteralPath $dllPath) -and -not $script:DryRun) {
+            throw "Cannot register IIS module because DLL is missing: $dllPath"
+        }
+
+        $registered = Get-IISModuleRegistered -ModuleName $module.moduleName
+        if ($registered -and -not $script:Force) {
+            Write-Host -ForegroundColor Cyan "IIS global module '$($module.moduleName)' already registered. Skipping."
+            continue
+        }
+
+        if ($script:DryRun) {
+            Write-DryRun "Would register IIS global module '$($module.moduleName)' with image '$dllPath' and preCondition '$($module.preCondition)'. Force=$script:Force"
+            continue
+        }
+
+        if (Test-Path -LiteralPath $appCmd) {
+            if ($registered -and $script:Force) {
+                & $appCmd delete module /module.name:"$($module.moduleName)" /commit:apphost | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "appcmd failed to delete module '$($module.moduleName)' (exit code $LASTEXITCODE)." }
+            }
+            & $appCmd install module /name:"$($module.moduleName)" /image:"$dllPath" /preCondition:"$($module.preCondition)" /commit:apphost | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "appcmd failed to install module '$($module.moduleName)' (exit code $LASTEXITCODE)." }
+            Write-Host -ForegroundColor Cyan "Registered IIS global module '$($module.moduleName)'."
+        }
+        else {
+            throw "appcmd.exe not found. Cannot register IIS modules."
+        }
+    }
+}
+
+function Unregister-Module {
+    foreach ($module in $modules) {
+        try {
+            if ($script:DryRun) { Write-DryRun "Would unregister IIS global module '$($module.moduleName)'."; continue }
+            if (Test-Path -LiteralPath $appCmd) {
+                & $appCmd delete module /module.name:"$($module.moduleName)" /commit:apphost 2>$null | Out-Null
+                Write-Host -ForegroundColor Cyan "Unregistered IIS global module '$($module.moduleName)'."
+            }
+        }
+        catch { Write-Host -ForegroundColor Yellow "Warning: Failed unregistering module '$($module.moduleName)'. $($_.Exception.Message)" }
+    }
+}
+
+function Configure-Module-Server-Level {
+    foreach ($module in $modules) {
+        try {
+            if ($script:DryRun) { Write-DryRun "Would ensure server-level module reference exists for '$($module.moduleName)'."; continue }
+            if (Test-Path -LiteralPath $appCmd) {
+                $output = & $appCmd list config -section:system.webServer/modules 2>$null
+                $alreadyPresent = ($output -match [regex]::Escape($module.moduleName))
+
+                if ($alreadyPresent -and -not $script:Force) { continue }
+
+                if ($alreadyPresent -and $script:Force) {
+                    & $appCmd set config /section:system.webServer/modules "/-[name='$($module.moduleName)']" /commit:apphost | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "appcmd failed to remove server-level module '$($module.moduleName)' before re-add (exit code $LASTEXITCODE)." }
+                }
+
+                & $appCmd set config /section:system.webServer/modules "/+[`"name='$($module.moduleName)'`"]" /commit:apphost | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "appcmd failed to add server-level module '$($module.moduleName)' (exit code $LASTEXITCODE)." }
+                Write-Host -ForegroundColor Cyan "Configured server-level module '$($module.moduleName)'."
+            }
+        }
+        catch { Write-Host -ForegroundColor Yellow "Warning: Failed configuring server-level module '$($module.moduleName)'. $($_.Exception.Message)" }
+    }
+}
+
+function Clear-Module-Server-Level {
+    foreach ($module in $modules) {
+        try {
+            if ($script:DryRun) { Write-DryRun "Would remove server-level module reference '$($module.moduleName)'."; continue }
+            if (Test-Path -LiteralPath $appCmd) {
+                & $appCmd set config /section:system.webServer/modules "/-[name='$($module.moduleName)']" /commit:apphost 2>$null | Out-Null
+                Write-Host -ForegroundColor Cyan "Removed server-level module '$($module.moduleName)'."
+            }
+        }
+        catch { Write-Host -ForegroundColor Yellow "Warning: Failed removing server-level module '$($module.moduleName)'. $($_.Exception.Message)" }
+    }
+}
+
+function Add-Global-Noname-Module {
+    param([string]$ModuleDir)
+    Install-Global-IIS-Modules -ModuleDir $ModuleDir
+    Configure-Module-Server-Level
+}
+
+function Remove-Global-Noname-Module {
+    Clear-Module-Server-Level
+    Unregister-Module
+}
+
+function Verify-InstallState {
+    param([string]$ModuleDir)
+
+    $state = [ordered]@{
+        ComputerName         = $env:COMPUTERNAME
+        TimestampUtc         = (Get-Date).ToUniversalTime().ToString("o")
+        ModuleDir            = $ModuleDir
+        ModuleDirExists      = $false
+        Dlls                 = [System.Collections.Generic.List[object]]::new()
+        GlobalModulesPresent = [System.Collections.Generic.List[object]]::new()
+        ServerModulesPresent = [System.Collections.Generic.List[object]]::new()
+        EnvVars              = @{}
+        PendingActivation    = $null
+        LastPreflight        = $null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ModuleDir)) {
+        $state.ModuleDirExists = (Test-Path -LiteralPath $ModuleDir)
+        foreach ($module in $modules) {
+            $dllPath = Join-Path $ModuleDir $module.dllName
+            $state.Dlls.Add([PSCustomObject]@{
+                Name   = $module.dllName
+                Exists = (Test-Path -LiteralPath $dllPath)
+                Path   = $dllPath
+            }) | Out-Null
+        }
+    }
+
+    foreach ($module in $modules) {
+        $state.GlobalModulesPresent.Add([PSCustomObject]@{
+            Name    = $module.moduleName
+            Present = (Get-IISModuleRegistered -ModuleName $module.moduleName)
+        }) | Out-Null
+        $state.ServerModulesPresent.Add([PSCustomObject]@{
+            Name    = $module.moduleName
+            Present = $false
+        }) | Out-Null
+    }
+
+    foreach ($key in (@($sourceParams.Keys) + @($dir, "NONAME_LOG_FILE_LOCATION", "AZURE_INSTANCE_METADATA") | Select-Object -Unique)) {
+        $state.EnvVars[$key] = Get-Environment-Variable -envName $key
+    }
+
+    $state.PendingActivation = Get-PendingActivationStatus
+    $state.LastPreflight     = Read-PreflightState
+
+    [PSCustomObject]$state
+}
+
+function Should-ForwardEvent {
+    param([ValidateSet("Install","Uninstall","Activate")] [string]$EventType)
+    if ([string]::IsNullOrWhiteSpace($LogForwardUrl)) { return $false }
+    switch ($EventType) {
+        "Install"   { return [bool]$LogForwardOnInstall }
+        "Uninstall" { return [bool]$LogForwardOnUninstall }
+        "Activate"  { return [bool]$LogForwardOnActivate }
+        default     { return $false }
+    }
+}
+
+function Send-LogForwardEvent {
+    param(
+        [ValidateSet("Install","Uninstall","Activate")] [string]$EventType,
+        [ValidateSet("Started","Completed","Failed")] [string]$Status,
+        [string]$Message
+    )
+    if (-not (Should-ForwardEvent -EventType $EventType)) { return }
+
+    $payload = @{
+        eventType = $EventType
+        status    = $Status
+        message   = $Message
+        computer  = $env:COMPUTERNAME
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+        action    = $Action
+    } | ConvertTo-Json -Depth 5
+
+    if ($script:DryRun) { Write-DryRun "Would POST log-forward event to '$LogForwardUrl': $payload"; return }
+
+    try {
+        Invoke-WebRequest -Uri $LogForwardUrl -Method Post -ContentType "application/json" -Body $payload -TimeoutSec $LogForwardTimeoutSec -UseBasicParsing -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-Host -ForegroundColor Yellow "Warning: Failed forwarding event '$EventType/$Status'. $($_.Exception.Message)"
+    }
+}
+
+function Invoke-IISReset {
+    if ($script:DryRun) { Write-DryRun "Would perform 'iisreset.exe /restart'."; return }
+    Write-Host -ForegroundColor Cyan "Performing IIS restart."
+    $proc = Start-Process "iisreset.exe" -ArgumentList "/restart" -NoNewWindow -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { throw "iisreset.exe failed with exit code $($proc.ExitCode)." }
+}
+
+function Invoke-NonameActivation {
+    try {
+        $ErrorActionPreference = "Stop"
+        if ($script:Force) { Write-Host -ForegroundColor Yellow "[FORCE MODE ENABLED]" }
+
+        if (Should-ForwardEvent -EventType "Activate") { Send-LogForwardEvent -EventType "Activate" -Status "Started" -Message "Activation started." }
+        Send-DynatraceEvent -EventType "CUSTOM_DEPLOYMENT" -Title "Noname Activation Started" `
+            -Description "Activation initiated on $env:COMPUTERNAME." -Properties @{ "noname.phase" = "activate" }
+
+        Write-Host -ForegroundColor Cyan "Writing source parameters to machine environment before activation."
+        Set-Source-Parameters
+        Set-Azure-Metadata
+        Write-Host -ForegroundColor Cyan "Source parameters committed. Performing IIS restart."
+        Invoke-IISReset
+        Clear-PendingState -Type "All"
+
+        if (Should-ForwardEvent -EventType "Activate") { Send-LogForwardEvent -EventType "Activate" -Status "Completed" -Message "Activation completed successfully." }
+        Send-DynatraceEvent -EventType "CUSTOM_DEPLOYMENT" -Title "Noname Activation Completed" `
+            -Description "Activation completed successfully on $env:COMPUTERNAME." -Properties @{ "noname.phase" = "activate"; "noname.result" = "success" }
+
+        Write-Host -ForegroundColor Green "Activation completed successfully."
+    }
+    catch {
+        if (Should-ForwardEvent -EventType "Activate") { Send-LogForwardEvent -EventType "Activate" -Status "Failed" -Message $_.Exception.Message }
+        Send-DynatraceEvent -EventType "ERROR_EVENT" -Title "Noname Activation Failed" `
+            -Description $_.Exception.Message -Properties @{ "noname.phase" = "activate"; "noname.result" = "failure" }
+        Write-Error "[ERROR] Activation failed.`n $($_.Exception.Message)"
+        throw
+    }
+}
+
+function Get-Agent-Status {
+    param([string]$InstallDir)
+
+    $moduleDir = if (-not [string]::IsNullOrWhiteSpace($InstallDir)) {
+        Get-Install-Dir-Path -InstallDir $InstallDir
+    }
+    else {
+        $existing = Get-Environment-Variable -envName $dir
+        if ([string]::IsNullOrWhiteSpace($existing)) { (Get-Default-Paths).InstallDir } else { $existing }
+    }
+
+    [PSCustomObject]@{
+        ComputerName = $env:COMPUTERNAME
+        Action       = "status"
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString("o")
+        InstallDir   = $moduleDir
+        State        = Verify-InstallState -ModuleDir $moduleDir
+    }
+}
+
+function Install-Agent {
+    param([string]$InstallDir)
+
+    $moduleDir   = $null
+    $originalEap = $ErrorActionPreference
+    $logCreated  = $false
+    $iisTouched  = $false
+
+    try {
+        $ErrorActionPreference = "Stop"
+        Validate-InstallParameters
+
+        # -------------------------------------------------------------------
+        # Preflight gate
+        # Rule 1: Any FAIL              -> always block (-Force has no effect)
+        # Rule 2: Engine WARN           -> block unless -Force
+        # Rule 3: Other WARNs           -> block only when -FailOnWarnings set
+        #
+        # Preflight state is persisted and Dynatrace notified BEFORE any
+        # blocking decision so the outcome is always recorded.
+        # -------------------------------------------------------------------
+        Write-Host -ForegroundColor Cyan "Running preflight checks before install..."
+        $preflight = Test-Preflight
+        $preflight.Results | Format-Table -AutoSize
+
+        Write-PreflightState -PreflightResult $preflight
+
+        Send-DynatraceEvent -EventType "CUSTOM_INFO" -Title "Noname Preflight Completed" `
+            -Description ("Preflight: $($preflight.Summary.Pass) PASS / $($preflight.Summary.Warn) WARN / $($preflight.Summary.Fail) FAIL") `
+            -Properties @{
+                "noname.phase"               = "preflight"
+                "noname.preflight.pass"      = ([string]$preflight.Summary.Pass)
+                "noname.preflight.warn"      = ([string]$preflight.Summary.Warn)
+                "noname.preflight.fail"      = ([string]$preflight.Summary.Fail)
+                "noname.preflight.exit_code" = ([string]$preflight.Summary.ExitCode)
+                "noname.preflight.engine"    = ([string]$preflight.Summary.EngineCheckStatus)
+            }
+
+        # Rule 1
+        if ($preflight.Summary.Fail -gt 0) {
+            throw ("Preflight failed with $($preflight.Summary.Fail) failure(s). Resolve the issues above before installing.")
+        }
+
+        # Rule 2
+        if ($preflight.Summary.EngineCheckStatus -eq "WARN") {
+            if (-not $script:Force) {
+                throw ("Preflight: engine connectivity check returned WARN. " +
+                       "The Noname engine at '$NonameEngineUrl' could not be reached. " +
+                       "Resolve connectivity or re-run with -Force to override this check.")
+            }
+            Write-Host -ForegroundColor Yellow "Warning: Engine connectivity WARN overridden by -Force. Proceeding."
+        }
+
+        # Rule 3
+        if ($preflight.Summary.ExitCode -ne 0) {
+            throw ("Preflight did not pass ($($preflight.Summary.Warn) warning(s) with -FailOnWarnings enabled). Resolve the issues above before installing.")
+        }
+
+        Write-Host -ForegroundColor Green "Preflight passed ($($preflight.Summary.Pass) checks). Proceeding with install."
+
+        if ($script:DryRun) { Write-DryRun "Starting install simulation." }
+        if ($script:Force)  { Write-Host -ForegroundColor Yellow "[FORCE MODE ENABLED]" }
+
+        if (Should-ForwardEvent -EventType "Install") { Send-LogForwardEvent -EventType "Install" -Status "Started" -Message "Install started." }
+        Send-DynatraceEvent -EventType "CUSTOM_DEPLOYMENT" -Title "Noname Install Started" `
+            -Description "Install initiated on $env:COMPUTERNAME." -Properties @{ "noname.phase" = "install" }
+
+        $moduleDir = Get-Install-Dir-Path -InstallDir $InstallDir
+        Copy-Noname-Module-To-Dir -moduleDir $moduleDir
+        Install-Runtime-Libraries
+
+        Create-Noname-Log
+        $logCreated = $true
+
+        if (-not (Test-IISAvailable)) {
+            Write-Host -ForegroundColor Yellow "Warning: IIS not detected. Skipping module registration."
+        }
+        else {
+            Install-Global-IIS-Modules -ModuleDir $moduleDir
+            Configure-Module-Server-Level
+            $iisTouched = $true
+        }
+
+        $verification = Verify-InstallState -ModuleDir $moduleDir
+        $verification | Format-List | Out-String | Write-Host
+
+        Clear-PendingState -Type "Uninstall"
+        Clear-PendingState -Type "Install"
+        Write-PendingState -Type "Install" -Reason "Module installed and registered. Run activate to write source parameters and recycle workers."
+
+        if (Should-ForwardEvent -EventType "Install") { Send-LogForwardEvent -EventType "Install" -Status "Completed" -Message "Install completed successfully." }
+        Send-DynatraceEvent -EventType "CUSTOM_DEPLOYMENT" -Title "Noname Install Completed" `
+            -Description "Install completed successfully on $env:COMPUTERNAME." -Properties @{ "noname.phase" = "install"; "noname.result" = "success" }
+
+        Write-Host -ForegroundColor Green "Install Agent completed successfully."
+        Write-Host -ForegroundColor Yellow "Source parameters not yet written. Run activate to commit env vars and recycle app pools."
+    }
+    catch {
+        if ($script:DryRun) {
+            Write-Host -ForegroundColor Yellow "Warning: Dry-run failed. No rollback required — no changes were made."
+        }
+        else {
+            Write-Host -ForegroundColor Yellow "Warning: Install failed. Attempting rollback."
+            try { if ($iisTouched -and (Test-IISAvailable)) { Clear-Module-Server-Level } } catch {}
+            try { if ($iisTouched -and (Test-IISAvailable)) { Unregister-Module } }         catch {}
+            try { if ($moduleDir) { Remove-Noname-Module-From-Dir -moduleDir $moduleDir } }  catch {}
+            try { if ($logCreated) { Clear-Noname-Log-State } }                              catch {}
+            try { Clear-PendingState -Type "All" }                                           catch {}
+        }
+
+        if (Should-ForwardEvent -EventType "Install") { Send-LogForwardEvent -EventType "Install" -Status "Failed" -Message $_.Exception.Message }
+        Send-DynatraceEvent -EventType "ERROR_EVENT" -Title "Noname Install Failed" `
+            -Description $_.Exception.Message -Properties @{ "noname.phase" = "install"; "noname.result" = "failure" }
+
+        Write-Error "[ERROR] An error occurred.`n $($_.Exception.Message)"
+        throw
+    }
+    finally {
+        $ErrorActionPreference = $originalEap
+    }
+}
+
+function Repair-Agent {
+    param([string]$InstallDir)
+
+    $originalEap = $ErrorActionPreference
+
+    try {
+        $ErrorActionPreference = "Stop"
+        Validate-InstallParameters
+
+        if ($script:DryRun) { Write-DryRun "Starting repair simulation." }
+        if ($script:Force)  { Write-Host -ForegroundColor Yellow "[FORCE MODE ENABLED]" }
+
+        Send-DynatraceEvent -EventType "CUSTOM_DEPLOYMENT" -Title "Noname Repair Started" `
+            -Description "Repair initiated on $env:COMPUTERNAME." -Properties @{ "noname.phase" = "repair" }
+
+        $moduleDir = Get-Install-Dir-Path -InstallDir $InstallDir
+        New-NonameDirectory -Path $moduleDir
+
+        $needsCopy = $script:Force
+        if (-not $needsCopy) {
+            foreach ($module in $modules) {
+                $dllPath = Join-Path $moduleDir $module.dllName
+                if (-not (Test-Path -LiteralPath $dllPath)) { $needsCopy = $true }
+            }
+        }
+
+        if ($needsCopy) { Copy-Noname-Module-To-Dir -moduleDir $moduleDir }
+        else            { Set-Environment-Variable -envName $dir -envValue $moduleDir }
+
+        Create-Noname-Log
+        Install-Runtime-Libraries
+
+        if (Test-IISAvailable) {
+            Install-Global-IIS-Modules -ModuleDir $moduleDir
+            Configure-Module-Server-Level
+        }
+
+        Clear-PendingState -Type "All"
+        Write-PendingState -Type "Install" -Reason "Repair completed. Run activate to commit source parameters and recycle workers."
+
+        $state = Verify-InstallState -ModuleDir $moduleDir
+        $state | Format-List | Out-String | Write-Host
+
+        Send-DynatraceEvent -EventType "CUSTOM_DEPLOYMENT" -Title "Noname Repair Completed" `
+            -Description "Repair completed successfully on $env:COMPUTERNAME." -Properties @{ "noname.phase" = "repair"; "noname.result" = "success" }
+
+        Write-Host -ForegroundColor Green "Repair-Agent completed successfully."
+        Write-Host -ForegroundColor Yellow "Source parameters not yet written. Run activate to commit env vars and recycle app pools."
+    }
+    catch {
+        Send-DynatraceEvent -EventType "ERROR_EVENT" -Title "Noname Repair Failed" `
+            -Description $_.Exception.Message -Properties @{ "noname.phase" = "repair"; "noname.result" = "failure" }
+        Write-Error "[ERROR] Repair failed.`n $($_.Exception.Message)"
+        throw
+    }
+    finally {
+        $ErrorActionPreference = $originalEap
+    }
+}
+
+function Uninstall-Agent {
+    param([string]$InstallDir)
+
+    $originalEap = $ErrorActionPreference
+
+    try {
+        $ErrorActionPreference = "Stop"
+
+        if ($script:DryRun) { Write-DryRun "Starting uninstall simulation." }
+        if ($script:Force)  { Write-Host -ForegroundColor Yellow "[FORCE MODE ENABLED]" }
+
+        if (Should-ForwardEvent -EventType "Uninstall") { Send-LogForwardEvent -EventType "Uninstall" -Status "Started" -Message "Uninstall started." }
+        Send-DynatraceEvent -EventType "CUSTOM_DEPLOYMENT" -Title "Noname Uninstall Started" `
+            -Description "Uninstall initiated on $env:COMPUTERNAME." -Properties @{ "noname.phase" = "uninstall" }
+
+        $moduleDir = if (-not [string]::IsNullOrWhiteSpace($InstallDir)) {
+            Get-Install-Dir-Path -InstallDir $InstallDir
+        }
+        else {
+            $existing = Get-Environment-Variable -envName $dir
+            if ([string]::IsNullOrWhiteSpace($existing)) { (Get-Default-Paths).InstallDir } else { $existing }
+        }
+
+        if (Test-IISAvailable) {
+            Clear-Module-Server-Level
+            Unregister-Module
+        }
+
+        Write-Host -ForegroundColor Cyan "Restarting IIS to unload module before clearing environment variables."
+        Invoke-IISReset
+
+        Clear-Noname-Source-Parameters
+        Clear-Noname-Log-State
+        Remove-Noname-Module-From-Dir -moduleDir $moduleDir
+
+        Clear-PendingState -Type "Install"
+        Write-PendingState -Type "Uninstall" -Reason "Module uninstalled and workers recycled. Environment variables cleared."
+
+        if (Should-ForwardEvent -EventType "Uninstall") { Send-LogForwardEvent -EventType "Uninstall" -Status "Completed" -Message "Uninstall completed successfully." }
+        Send-DynatraceEvent -EventType "CUSTOM_DEPLOYMENT" -Title "Noname Uninstall Completed" `
+            -Description "Uninstall completed successfully on $env:COMPUTERNAME." -Properties @{ "noname.phase" = "uninstall"; "noname.result" = "success" }
+
+        Write-Host -ForegroundColor Green "Uninstall Agent completed successfully."
+    }
+    catch {
+        if (Should-ForwardEvent -EventType "Uninstall") { Send-LogForwardEvent -EventType "Uninstall" -Status "Failed" -Message $_.Exception.Message }
+        Send-DynatraceEvent -EventType "ERROR_EVENT" -Title "Noname Uninstall Failed" `
+            -Description $_.Exception.Message -Properties @{ "noname.phase" = "uninstall"; "noname.result" = "failure" }
+        Write-Error "[ERROR] Uninstall failed.`n $($_.Exception.Message)"
+        throw
+    }
+    finally {
+        $ErrorActionPreference = $originalEap
+    }
+}
+
+Import-RequiredModules
+
+if ($ExecutionContext.SessionState.Module) {
+    Export-ModuleMember -Function Install-Agent               -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Uninstall-Agent             -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Invoke-NonameActivation     -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Get-PendingActivationStatus -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Add-Global-Noname-Module    -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Remove-Global-Noname-Module -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Repair-Agent                -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Get-Agent-Status            -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Read-PreflightState         -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Write-PreflightState        -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function Send-DynatraceEvent         -ErrorAction SilentlyContinue
+}
+
+switch ($Action) {
+    "install"   { Install-Agent -InstallDir $InstallDir }
+    "uninstall" { Uninstall-Agent -InstallDir $InstallDir }
+    "activate"  { Invoke-NonameActivation }
+    "status"    { Get-Agent-Status -InstallDir $InstallDir | Format-List }
+
+    "preflight" {
+        $preflight = Test-Preflight
+        $preflight.Summary | Format-List
+        ""
+        $preflight.Results | Format-Table -AutoSize
+
+        Write-PreflightState -PreflightResult $preflight
+
+        Send-DynatraceEvent -EventType "CUSTOM_INFO" -Title "Noname Preflight Completed (standalone)" `
+            -Description ("Preflight: $($preflight.Summary.Pass) PASS / $($preflight.Summary.Warn) WARN / $($preflight.Summary.Fail) FAIL") `
+            -Properties @{
+                "noname.phase"               = "preflight"
+                "noname.preflight.pass"      = ([string]$preflight.Summary.Pass)
+                "noname.preflight.warn"      = ([string]$preflight.Summary.Warn)
+                "noname.preflight.fail"      = ([string]$preflight.Summary.Fail)
+                "noname.preflight.exit_code" = ([string]$preflight.Summary.ExitCode)
+                "noname.preflight.engine"    = ([string]$preflight.Summary.EngineCheckStatus)
+            }
+
+        if ($preflight.Summary.ExitCode -ne 0) { exit 1 } else { exit 0 }
+    }
+
+    "repair" { Repair-Agent -InstallDir $InstallDir }
+    "none"   { }
+}
